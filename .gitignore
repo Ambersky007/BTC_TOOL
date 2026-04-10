@@ -1,0 +1,1 @@
+"# Python 虚拟环境"  ".venv/"  "venv/"  "__pycache__/"  "*.py[cod]"  "# 日志文件"  "logs/"  "*.log"  "# IDE 配置"  ".idea/"  ".vscode/"  "# 系统文件"  "Thumbs.db"  ".DS_Store" 
