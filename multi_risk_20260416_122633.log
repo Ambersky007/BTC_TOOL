@@ -1,0 +1,12 @@
+2026-04-16 12:26:33,470 | 🔥 多币风控系统启动
+2026-04-16 12:26:34,893 | Websocket connected
+2026-04-16 12:26:34,894 | WS连接成功
+2026-04-16 12:26:34,939 | [同步失败]BTCUSDT string indices must be integers, not 'str'
+2026-04-16 12:26:36,247 | [同步失败]ETHUSDT string indices must be integers, not 'str'
+2026-04-16 12:26:37,553 | [同步失败]CLUSDT string indices must be integers, not 'str'
+2026-04-16 12:26:43,842 | [同步失败]BTCUSDT string indices must be integers, not 'str'
+2026-04-16 12:26:45,082 | [同步失败]ETHUSDT string indices must be integers, not 'str'
+2026-04-16 12:26:46,353 | [同步失败]CLUSDT string indices must be integers, not 'str'
+2026-04-16 12:26:52,809 | [同步失败]BTCUSDT string indices must be integers, not 'str'
+2026-04-16 12:26:54,059 | [同步失败]ETHUSDT string indices must be integers, not 'str'
+2026-04-16 12:26:55,348 | [同步失败]CLUSDT string indices must be integers, not 'str'
