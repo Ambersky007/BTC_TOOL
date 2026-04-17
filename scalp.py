@@ -1035,9 +1035,10 @@ def process_price():
     global loss_count, last_check_time, processing, last_holding_log_time
     global local_max_profit_pct, local_max_price, local_min_price
     global max_profit_pct, max_price_since_entry, min_price_since_entry
-    global time_at_max_profit
+    global time_at_max_profit, official_unrealized_profit, official_isolated_margin
     if processing: return
     processing = True
+    price_anomaly = False  # 价格偏离标志位，仅拦截开仓，不拦截平仓
     try:
         now = time.time()
         with data_lock:
@@ -1051,34 +1052,43 @@ def process_price():
             else:
                 snap_price = raw_price
         if snap_price is None:
+            processing = False
             return
+        # 价格偏离不再直接 return，只设置标志位
         if raw_price and mark_price:
             diff = abs(raw_price - mark_price) / raw_price
             if diff > 0.001:
                 ws_delay = now - last_ws_time
                 if ws_delay <= 1:
-                    log("⚠️ 价格偏离异常，暂停交易判断")
-                    return
+                    # log("⚠️ 价格偏离异常，仅暂停开仓判断，止盈止损继续执行")
+                    price_anomaly = True
         if now - last_price_print_time >= 5:
             ws_delay = now - last_ws_time
             agg_delay = now - last_aggTrade_time
             log(f"[价格] Last:{raw_price} | Mark:{mark_price if mark_price else 'N/A'} | 延迟:{ws_delay:.1f}s | aggDelay:{agg_delay:.1f}s")
             last_price_print_time = now
         if loss_count >= MAX_CONTINUOUS_LOSS:
-            if now - loss_reset_time < LOSS_RESET_SEC: return
+            if now - loss_reset_time < LOSS_RESET_SEC:
+                processing = False
+                return
             loss_count = 0
         update_liquidity_zone()
         with data_lock:
             if liquidity_zone and raw_price:
                 if detect_touch(raw_price, prev_price_v23, liquidity_zone):
                     liquidity_zone.touch_count = min(10, liquidity_zone.touch_count + 1)
-        with lock:
-            if USE_LOCAL_SIMULATION:
-                cur_pos = local_position;
-                cur_ep = local_entry_price
-                cur_max_price = local_max_price;
-                cur_min_price = local_min_price
-            else:
+        # 硬止损最高优先级，任何情况都必须执行
+        if manage_position():
+            processing = False
+            return
+        # 盈亏判定双轨制隔离
+        if USE_LOCAL_SIMULATION:
+            cur_pos = local_position;
+            cur_ep = local_entry_price
+            cur_max_price = local_max_price;
+            cur_min_price = local_min_price
+        else:
+            with lock:
                 cur_pos = position;
                 cur_ep = entry_price
                 cur_max_price = max_price_since_entry;
@@ -1086,41 +1096,69 @@ def process_price():
         if not cur_pos or cur_ep <= 0:
             pass
         else:
-            pr = (snap_price - cur_ep) / cur_ep if cur_pos == "long" else (cur_ep - snap_price) / cur_ep
-            if pr <= -SCALP_SL:
-                close_position(f"硬止损({SCALP_SL * 100}%)")
-                return
-            if cur_pos == "long":
-                if snap_price > cur_max_price:
-                    cur_max_price = snap_price
-                    time_at_max_profit = time.time()
-            else:
-                if snap_price < cur_min_price:
-                    cur_min_price = snap_price
-                    time_at_max_profit = time.time()
+            # 本地撮合统一使用 ROI(资金收益率) 计算，与实盘对齐
             if USE_LOCAL_SIMULATION:
+                # 本地模式计算绝对浮盈
+                pnl_abs = (snap_price - cur_ep) * actual_position_amt if cur_pos == "long" else (
+                                                                                                            cur_ep - snap_price) * actual_position_amt
+                margin = abs(actual_position_amt) * cur_ep / LEVERAGE if LEVERAGE > 0 else 0
+                pr = pnl_abs / margin if margin > 0 else 0  # pr 现在是真正的 ROI
+                if pr <= -SCALP_SL:
+                    close_position(f"硬止损({SCALP_SL * 100}%)")
+                    processing = False
+                    return
+                # 追踪极值价格与极值收益率
+                if cur_pos == "long":
+                    if snap_price > cur_max_price: cur_max_price = snap_price; time_at_max_profit = time.time()
+                else:
+                    if snap_price < cur_min_price: cur_min_price = snap_price; time_at_max_profit = time.time()
                 local_max_price = cur_max_price;
                 local_min_price = cur_min_price
+                max_pnl_abs = (cur_max_price - cur_ep) * actual_position_amt if cur_pos == "long" else (
+                                                                                                                   cur_ep - cur_min_price) * actual_position_amt
+                max_profit_pct = max_pnl_abs / margin if margin > 0 else 0  # max_profit_pct 也变成真正的最高 ROI
+            # 实盘模式：直接使用官方精准盈亏
             else:
-                max_price_since_entry = cur_max_price;
-                min_price_since_entry = cur_min_price
-            max_profit_pct = (cur_max_price - cur_ep) / cur_ep if cur_pos == "long" else (
-                                                                                                     cur_ep - cur_min_price) / cur_ep
+                with lock:
+                    off_pnl = official_unrealized_profit
+                    off_margin = official_isolated_margin
+                if cur_pos == "long":
+                    if snap_price > cur_max_price:
+                        cur_max_price = snap_price
+                        time_at_max_profit = time.time()
+                else:
+                    if snap_price < cur_min_price:
+                        cur_min_price = snap_price
+                        time_at_max_profit = time.time()
+                with lock:
+                    max_price_since_entry = cur_max_price
+                    min_price_since_entry = cur_min_price
+                pr = off_pnl / off_margin if off_margin > 0 else 0
+                max_pnl_abs = (cur_max_price - cur_ep) * actual_position_amt if cur_pos == "long" else (
+                                                                                                                   cur_ep - cur_min_price) * actual_position_amt
+                margin = abs(actual_position_amt) * cur_ep / LEVERAGE if LEVERAGE > 0 else 0
+                max_profit_pct = max_pnl_abs / margin if margin > 0 else 0
             status_parts = []
+            # 调整手续费门槛判断基准
+            # 20倍杠杆下，0.04%价格波动=0.8%ROI，覆盖双边手续费(约0.06%价格波动)至少需要1.2%的ROI
+            MIN_ROI_COVER_FEE = 0.008  # 0.8% ROI 视为覆盖手续费安全垫
             if max_profit_pct > 0:
                 retracement = pr / max_profit_pct if max_profit_pct > 0 else 0
                 time_since_high = time.time() - time_at_max_profit
-                if pr <= 0.0006:
-                    status_parts.append(f"追踪止盈(手续费不足🟡 当前盈利{pr:.2%}<0.06%)")
+                if (USE_LOCAL_SIMULATION and pr < MIN_ROI_COVER_FEE) or (not USE_LOCAL_SIMULATION and off_pnl < 0):
+                    status_parts.append(f"追踪止盈(手续费不足🟡 当前ROI:{pr:.2%}<{MIN_ROI_COVER_FEE * 100:.1f}%)")
                 else:
-                    if max_profit_pct < 0.0006:
-                        status_parts.append(f"微利追踪(等待🟡 最高盈利{max_profit_pct:.2%}<0.06%)")
+                    # 微利门槛也按比例放大
+                    if max_profit_pct < MIN_ROI_COVER_FEE * 1.2:
+                        status_parts.append(
+                            f"微利追踪(等待🟡 最高ROI:{max_profit_pct:.2%}<{MIN_ROI_COVER_FEE * 1.2 * 100:.1f}%)")
                     else:
                         trail_tp = (time_since_high >= 20) and (retracement <= 0.65)
                         status_parts.append(
                             f"极速追踪({'触发🔴' if trail_tp else '等待🟡'} 历高停顿{time_since_high:.0f}s/20s 回撤比{retracement:.2%}/65%)")
                         if trail_tp:
                             close_position("极速追踪止盈")
+                            processing = False
                             return
                         avg_vol_10k = 0.0
                         with data_lock:
@@ -1146,21 +1184,28 @@ def process_price():
                             f"回撤遇阻({'触发🔴' if abs_tp else '等待🟡'} 回撤>15%:{'✅' if is_retracement_over_15pct else '❌'} 反向量:{reverse_order_vol:.1f}>2.5倍均量:{avg_vol_10k:.1f}:{'✅' if is_huge_reverse_vol else '❌'})")
                         if abs_tp:
                             close_position("绝对回撤保护(放量遇阻)")
+                            processing = False
                             return
             else:
                 status_parts.append(f"追踪止盈(未启动🟢)")
             if now - last_holding_log_time >= 2:
-                log(f"[持仓状态] {cur_pos} | 当前盈亏:{pr:.2%} | 最高:{max_profit_pct:.2%} | 状态面板: {' | '.join(status_parts)}")
+                if USE_LOCAL_SIMULATION:
+                    log(f"[本地持仓状态-ROI修正] {cur_pos} | 当前ROI:{pr:.2%} | 最高ROI:{max_profit_pct:.2%} | 状态面板: {' | '.join(status_parts)}")
+                else:
+                    with lock:
+                        log(f"[实盘持仓状态-官方] {cur_pos} | 官方盈亏:{off_pnl:.2f}U (ROI:{pr:.2%}) | 极值最高ROI:{max_profit_pct:.2%} | 状态面板: {' | '.join(status_parts)}")
                 last_holding_log_time = now
         if time.time() - last_check_time > 1:
             check_order_filled();
             last_check_time = time.time()
         check_order_timeout()
-        log_entry_conditions()
-        has_order = local_active_order if USE_LOCAL_SIMULATION else active_order
-        if has_order: return
-        if time.time() > cooldown_until:
-            v21_scalp_main()
+        # 🚀🚀🚀 核心优化：只有在无持仓时，才执行开仓雷达和开仓策略 🚀🚀🚀
+        has_position = local_position if USE_LOCAL_SIMULATION else position
+        if not has_position:
+            log_entry_conditions()
+            has_order = local_active_order if USE_LOCAL_SIMULATION else active_order
+            if not has_order and not price_anomaly and time.time() > cooldown_until:
+                v21_scalp_main()
     finally:
         processing = False
 
