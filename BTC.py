@@ -3,10 +3,7 @@
 """
 盈利 ≥ 1.5% 立即市价平仓
 优先级最高：比回撤止盈、硬止损都优先触发
-开多价格 = 最近 3 根收盘 1 分钟 K 线的 最低点（下沿）
-开空价格 = 最近 3 根收盘 1 分钟 K 线的 最高点（上沿）
-挂单超时从 35s → 120s
-禁用了盘口价格偏移就撤单697行，添加了return
+🔥 终极优化：防洗盘结构止损 + 挂单靠边 + 分段止盈 + 禁连续单边开仓
 """
 import websocket  # WebSocket库：实时接收币安行情、成交、盘口数据
 import json  # 处理JSON数据：解析币安推送的行情信息
@@ -74,12 +71,12 @@ WS_SYMBOL = "btcusdt"  # WebSocket专用符号：小写格式
 # ======================
 # 策略参数（完全保留）
 # ======================
-WINDOW = 10 # 价格缓存窗口：保存最近10个价格，越大越迟顿
+WINDOW = 10  # 价格缓存窗口：保存最近10个价格，越大越迟顿
 MAX_RANGE = 0.0003  # 最大价格区间（策略备用）
 MIN_PROFIT = 0.0003  # 最小盈利阈值
 TRAILING_PROFIT = 0.0003  # 移动止盈阈值
-STOP_LOSS = 0.0003  # 止损阈值
-MAX_HOLD_TIME = 300  # 最大持仓时间：300秒强制平仓
+STOP_LOSS = -0.001  # 🔥 核心修改3：硬止损放宽至 -0.1%，匹配1.5%止盈
+MAX_HOLD_TIME = 300  # 最大持仓时间：300秒强制平仓 (🔥 核心修改6：此参数已逻辑作废，不再强制平仓)
 ORDER_TIMEOUT = 120  # 挂单超时：120秒未成交自动撤单
 SLIPPAGE = 5  # 滑点（备用）
 PRICE_STEP = 0.5  # 价格步长：BTC价格精度0.5
@@ -136,7 +133,7 @@ d_list = []
 j_list = []
 # 新增：最近成交方向与量能统计
 trade_volume_buffer = []  # 存放格式: {'side': 'buy'/'sell', 'qty': float}
-# 新增：1分钟K线缓存 (只保留最近3根已收盘的)
+# 新增：1分钟K线缓存 (🔥 核心修改4：保留最近5根以支持靠边挂单计算)
 kline_1m_closed = []  # 存放格式: {'open':, 'high':, 'low':, 'close':, 'volume':}
 # 新增：处理标志位
 processing = False
@@ -387,6 +384,16 @@ def is_sell_dominant():
     return sell_vol > buy_vol
 
 
+# 🔥🔥🔥 新增问题5修复：拦截连续单边K线，防接飞刀
+def is_trending_kline():
+    if len(kline_1m_closed) < 3:
+        return False
+    k0, k1, k2 = kline_1m_closed[-1], kline_1m_closed[-2], kline_1m_closed[-3]
+    all_up = k0['close'] > k0['open'] and k1['close'] > k1['open'] and k2['close'] > k2['open']
+    all_down = k0['close'] < k0['open'] and k1['close'] < k1['open'] and k2['close'] < k2['open']
+    return all_up or all_down
+
+
 # ======================
 # 持仓/下单/撤单/平仓 (双模式整合)
 # ======================
@@ -576,10 +583,10 @@ def send_market_order(side, reduce=False, qty=None):
     if USE_LOCAL_SIMULATION:
         if reduce:
             log(f"[本地市价平仓成功] {side} | 价格:{raw_price} | 数量:{close_qty}")
-            local_position = None;
+            local_position = None
             local_entry_price = 0.0
-            local_max_profit_pct = 0.0;
-            local_max_price = 0.0;
+            local_max_profit_pct = 0.0
+            local_max_price = 0.0
             local_min_price = 999999.0
             local_trade_lock = False
             entry_time = 0
@@ -591,8 +598,8 @@ def send_market_order(side, reduce=False, qty=None):
             local_entry_price = raw_price
             actual_position_amt = close_qty  # 记录开仓数量
             # 开仓时初始化极值价格为开仓价，确保最高盈利计算准确
-            local_max_profit_pct = 0.0;
-            local_max_price = raw_price;
+            local_max_profit_pct = 0.0
+            local_max_price = raw_price
             local_min_price = raw_price
             local_trade_lock = False
             # 记录开仓时间和最高盈利起点时间
@@ -638,9 +645,9 @@ def cancel_order():
     global active_order, order_price, order_time, trade_lock, partial_filled_flag
     if USE_LOCAL_SIMULATION:
         if not local_active_order: return  # 无挂单直接返回
-        local_active_order = None;
-        local_order_price = 0;
-        local_order_time = 0;
+        local_active_order = None
+        local_order_price = 0
+        local_order_time = 0
         local_trade_lock = False
         log("[本地撤单成功]")
         return
@@ -653,10 +660,10 @@ def cancel_order():
         res = requests.delete(url, headers=h, timeout=3).json()
         # 修复：校验撤单结果，只有确认撤单成功或订单已不存在，才清空本地状态，防止幽灵挂单
         if res.get("status") in ["CANCELED", "EXPIRED"] or res.get("code") == -2011:
-            active_order = None;
-            order_price = 0;
-            order_time = 0;
-            trade_lock = False;
+            active_order = None
+            order_price = 0
+            order_time = 0
+            trade_lock = False
             partial_filled_flag = False
             # 撤单后同步真实仓位，确保止盈止损基于正确的数量运行
             sync_position()
@@ -670,32 +677,33 @@ def cancel_order():
 
 # 快速撤单：挂单价格偏离盘口过大立即撤单
 def check_fast_cancel():
-  """  # 修复：将 global 声明移到函数最开头
-    global local_order_price, order_price
-    if USE_LOCAL_SIMULATION:
-        if not local_active_order: return
-        try:
-            if not orderbook["bids"] or not orderbook["asks"]: return
-            best_bid = float(orderbook["bids"][0][0])
-        except:
-            return
-        # 挂单价格与买一价差超过50个步长，撤单
-        if abs(local_order_price - best_bid) > 50 * PRICE_STEP:
-            cancel_order()
-    else:
-        if not active_order: return
-        try:
-            if not orderbook["bids"] or not orderbook["asks"]: return
-            best_bid = float(orderbook["bids"][0][0])
-        except:
-            return
-        # 挂单价格与买一价差超过50个步长，撤单
-        if abs(order_price - best_bid) > 50 * PRICE_STEP:
-            cancel_order()
-"""
-
-  return
+    """  # 修复：将 global 声明移到函数最开头
+      global local_order_price, order_price
+      if USE_LOCAL_SIMULATION:
+          if not local_active_order: return
+          try:
+              if not orderbook["bids"] or not orderbook["asks"]: return
+              best_bid = float(orderbook["bids"][0][0])
+          except:
+              return
+          # 挂单价格与买一价差超过50个步长，撤单
+          if abs(local_order_price - best_bid) > 50 * PRICE_STEP:
+              cancel_order()
+      else:
+          if not active_order: return
+          try:
+              if not orderbook["bids"] or not orderbook["asks"]: return
+              best_bid = float(orderbook["bids"][0][0])
+          except:
+              return
+          # 挂单价格与买一价差超过50个步长，撤单
+          if abs(order_price - best_bid) > 50 * PRICE_STEP:
+              cancel_order()
+  """
+    return
     # 挂单超时撤单：部分成交等5秒，未成交等10秒
+
+
 def check_order_timeout():
     if USE_LOCAL_SIMULATION:
         if local_active_order and time.time() - local_order_time > ORDER_TIMEOUT:
@@ -733,8 +741,8 @@ def check_order_filled():
             local_active_order = None
             local_trade_lock = False
             # 开仓时初始化极值价格为开仓价，确保最高盈利计算准确
-            local_max_profit_pct = 0.0;
-            local_max_price = order_p;
+            local_max_profit_pct = 0.0
+            local_max_price = order_p
             local_min_price = order_p
             # 记录开仓时间和最高盈利起点时间
             entry_time = time.time()
@@ -750,13 +758,13 @@ def check_order_filled():
         d = requests.get(url, headers=h, timeout=3).json()
         # 🔥 全部成交
         if d.get("status") == "FILLED":
-            active_order = None;
-            trade_lock = False;
+            active_order = None
+            trade_lock = False
             partial_filled_flag = False
-            last_fill_time = time.time();
+            last_fill_time = time.time()
             entry_time = time.time()
-            max_profit_pct = 0.0;
-            max_price_since_entry = entry_price;
+            max_profit_pct = 0.0
+            max_price_since_entry = entry_price
             min_price_since_entry = entry_price
             time_at_max_profit = entry_time
             sync_position()  # 同步最新持仓与实际数量
@@ -769,8 +777,8 @@ def check_order_filled():
                 # 立即同步持仓，让止盈止损基于实际数量开始工作
                 sync_position()
                 entry_time = time.time()
-                max_profit_pct = 0.0;
-                max_price_since_entry = entry_price;
+                max_profit_pct = 0.0
+                max_price_since_entry = entry_price
                 min_price_since_entry = entry_price
                 time_at_max_profit = entry_time
         elif isinstance(d, dict) and d.get("code") == -1021:
@@ -836,10 +844,10 @@ def save_trade_records():
 def close_position(reason):
     global loss_count, cooldown_until, loss_reset_time, entry_time, time_at_max_profit
     if USE_LOCAL_SIMULATION:
-        pos = local_position;
+        pos = local_position
         ep = local_entry_price
     else:
-        pos = position;
+        pos = position
         ep = entry_price
     with lock:
         if not pos: return
@@ -929,6 +937,9 @@ def v18_entry_logic():
     except:
         return
     if not cond4: return
+    # 🔥 问题5修复：连续单边K线禁止开仓，防接飞刀
+    if is_trending_kline():
+        return
     # 必须有3根已收盘1分钟K线数据
     if len(kline_1m_closed) < 3: return
     k0, k1, k2 = kline_1m_closed[-1], kline_1m_closed[-2], kline_1m_closed[-3]
@@ -950,7 +961,7 @@ def v18_entry_logic():
     is_3_rise = (k0['close'] > k0['open']) and (k1['close'] > k1['open']) and (k2['close'] > k2['open'])
     is_3_vol_down = (k0['volume'] < k1['volume']) and (k1['volume'] < k2['volume'])
     long_cond_volume = not (is_3_rise and is_3_vol_down)
-    # KDJ：J <= 50, 上升, 力度达标
+    # KDJ：J <= 70, 上升, 力度达标
     long_cond_kdj_dir = j0 > j1
     long_cond_kdj_val = j0 <= 70
     current_j_up = j0 - j1 if long_cond_kdj_dir else 0
@@ -974,7 +985,7 @@ def v18_entry_logic():
     is_slow_drop = abs(k0['close'] - k0['open']) < avg_body_3 * 0.6
     short_cond_volume_2 = not (is_volume_rise_short and is_slow_drop)
     short_cond_volume = short_cond_volume_1 and short_cond_volume_2
-    # KDJ：J >= 50, 下降, 力度达标
+    # KDJ：J >= 30, 下降, 力度达标
     short_cond_kdj_dir = j0 < j1
     short_cond_kdj_val = j0 >= 30
     current_j_down = j1 - j0 if short_cond_kdj_dir else 0
@@ -990,7 +1001,7 @@ def v18_entry_logic():
             f"盘口非空:{'✅' if long_cond_bias else '❌'} | "
             f"无长上影:{'✅' if long_cond_shadow else '❌'} | "
             f"非缩量涨:{'✅' if long_cond_volume else '❌'} | "
-            f"J≤50:{'✅' if long_cond_kdj_val else '❌'}({j0:.1f}) | "
+            f"J≤70:{'✅' if long_cond_kdj_val else '❌'}({j0:.1f}) | "
             f"J上升:{'✅' if long_cond_kdj_dir else '❌'} | "
             f"J力度达标:{'✅' if long_cond_kdj_force else '❌'}(当前{current_j_up:.1f}/需{avg_j_up * 0.4:.1f}) | "
             f"买量主导:{'✅' if long_cond_flow else '❌'}"
@@ -1000,7 +1011,7 @@ def v18_entry_logic():
             f"盘口非多:{'✅' if short_cond_bias else '❌'} | "
             f"无长下影:{'✅' if short_cond_shadow else '❌'} | "
             f"量能过关:{'✅' if short_cond_volume else '❌'}(非缩量跌:{'✅' if short_cond_volume_1 else '❌'},非滞跌:{'✅' if short_cond_volume_2 else '❌'}) | "
-            f"J≥50:{'✅' if short_cond_kdj_val else '❌'}({j0:.1f}) | "
+            f"J≥30:{'✅' if short_cond_kdj_val else '❌'}({j0:.1f}) | "
             f"J下降:{'✅' if short_cond_kdj_dir else '❌'} | "
             f"J力度达标:{'✅' if short_cond_kdj_force else '❌'}(当前{current_j_down:.1f}/需{avg_j_down * 0.4:.1f}) | "
             f"卖量主导:{'✅' if short_cond_flow else '❌'}"
@@ -1009,17 +1020,24 @@ def v18_entry_logic():
         log(log_short)
         log("-" * 120)
         last_entry_log_time = now
-    # 下单执行
-
+    # 🔥🔥🔥 问题4修复：挂单价格远离中点，向边缘靠拢
     if long_ok:
-        # 开多 = 最近3根收盘K线 最低点（下影线最低）
-        min_3k = min(k['low'] for k in kline_1m_closed)
-        send_limit_order("BUY", normalize_price(min_3k))
+        if len(kline_1m_closed) >= 5 and len(price_buffer) >= 10:
+            low_5 = min(k['low'] for k in kline_1m_closed[-5:])
+            low_10 = min(price_buffer[-10:])
+            entry_price_long = low_5 + (low_10 - low_5) * 0.5
+        else:
+            entry_price_long = min(k['low'] for k in kline_1m_closed)
+        send_limit_order("BUY", normalize_price(entry_price_long))
         return
     if short_ok:
-        # 开空 = 最近3根收盘K线 最高点（上影线最高）
-        max_3k = max(k['high'] for k in kline_1m_closed)
-        send_limit_order("SELL", normalize_price(max_3k))
+        if len(kline_1m_closed) >= 5 and len(price_buffer) >= 10:
+            high_5 = max(k['high'] for k in kline_1m_closed[-5:])
+            high_10 = max(price_buffer[-10:])
+            entry_price_short = high_5 - (high_5 - high_10) * 0.5
+        else:
+            entry_price_short = max(k['high'] for k in kline_1m_closed)
+        send_limit_order("SELL", normalize_price(entry_price_short))
         return
 
 
@@ -1054,6 +1072,10 @@ def process_price():
             if cur_pos and cur_ep > 0:
                 # 🔥 修复1：当前盈亏 = (当前价 - 成交价) / 成交价 （带多空方向）
                 pr = (raw_price - cur_ep) / cur_ep if cur_pos == "long" else (cur_ep - raw_price) / cur_ep
+                # 🔥🔥🔥 问题6修复：持仓分阶段逻辑
+                hold_time = time.time() - entry_time if entry_time > 0 else 0
+                allow_stop = hold_time > 15  # 15秒内禁止止损
+                allow_trailing = hold_time > 60  # 60秒内禁止回撤止盈
                 # 🔥 修复2：最高盈利 = 自开仓以来的历史最高收益率
                 if USE_LOCAL_SIMULATION:
                     if cur_pos == "long":
@@ -1077,37 +1099,53 @@ def process_price():
                             time_at_max_profit = time.time()
                     cur_max_profit_pct = (max_price_since_entry - cur_ep) / cur_ep if cur_pos == "long" else (
                                                                                                                          cur_ep - min_price_since_entry) / cur_ep
-                # 1. 硬止损：亏损 >= 0.05% (匹配超短线止盈，20倍杠杆对应本金1%亏损)
-                if pr <= -0.0005:
+                # ==============================================
+                # 🔥🔥🔥 问题2&3修复：硬止损加保护期并放宽至-0.1%
+                # ==============================================
+                if allow_stop and pr <= STOP_LOSS:
                     should_close = True
-                    close_reason = "1%硬止损"
-
+                    close_reason = f"0.1%硬止损(持仓{hold_time:.0f}秒)"
+                # 🔥🔥🔥 问题2修复：结构破位止损 (15秒后生效)
+                if not should_close and allow_stop and len(kline_1m_closed) >= 3:
+                    if cur_pos == "long":
+                        stop_price = min(k['low'] for k in kline_1m_closed[-3:])
+                        if raw_price < stop_price:
+                            should_close = True
+                            close_reason = f"结构破位止损(跌破{stop_price})"
+                    elif cur_pos == "short":
+                        stop_price = max(k['high'] for k in kline_1m_closed[-3:])
+                        if raw_price > stop_price:
+                            should_close = True
+                            close_reason = f"结构破位止损(突破{stop_price})"
                 # ==============================================
                 # 🔥🔥🔥 新增：1.5% 固定止盈（优先级最高）
                 # ==============================================
                 if not should_close and pr >= 0.015:
                     should_close = True
                     close_reason = f"✅ 固定止盈：盈利≥1.5% 强制平仓 | 当前盈利:{pr:.2%}"
-
                 # ==============================================
-                # 🔥🔥🔥 新增：高优先级回撤止盈（70% 立即平仓）
+                # 🔥🔥🔥 问题1修复：分段回撤止盈（过滤手续费+分级保护）
                 # ==============================================
-                cond_profit_valid = cur_max_profit_pct > 0.0002
-                cond_retracement_70 = pr <= cur_max_profit_pct * 0.7  # 回撤70%
-
-                if not should_close and cond_profit_valid and cond_retracement_70:
+                # 至少盈利0.1%才允许回撤止盈(覆盖0.06%手续费)
+                cond_profit_valid = cur_max_profit_pct > 0.001
+                if cond_profit_valid:
+                    # 小利润严保护，大利润给空间
+                    if cur_max_profit_pct < 0.003:
+                        cond_retracement_70 = pr <= cur_max_profit_pct * 0.5
+                    else:
+                        cond_retracement_70 = pr <= cur_max_profit_pct * 0.7
+                else:
+                    cond_retracement_70 = False
+                if not should_close and allow_trailing and cond_profit_valid and cond_retracement_70:
                     should_close = True
-                    close_reason = f"🔥 高优先级止盈：盈利回撤70%强制平仓 | 最高:{cur_max_profit_pct:.2%} 当前:{pr:.2%}"
-
-                # 原有回撤止盈（保留，作为次级条件）
+                    close_reason = f"🔥 分段止盈：盈利回撤强制平仓 | 最高:{cur_max_profit_pct:.2%} 当前:{pr:.2%}"
+                # 原有回撤止盈（保留，作为次级条件，需60秒后生效）
                 time_since_max = time.time() - time_at_max_profit if time_at_max_profit > 0 else 0
                 cond_no_new_high = time_since_max > 20
                 cond_retracement = pr <= cur_max_profit_pct * 0.8
-
-                if not should_close and cond_profit_valid and cond_no_new_high and cond_retracement:
+                if not should_close and allow_trailing and cond_profit_valid and cond_no_new_high and cond_retracement:
                     should_close = True
                     close_reason = f"回撤止盈(最高{cur_max_profit_pct:.2%}回落至{pr:.2%}, 距最高盈利{time_since_max:.1f}秒)"
-
                 # 🔥 更新止盈止损状态打印
                 if now - last_holding_log_time >= 2:
                     retracement_ratio_str = "N/A"
@@ -1116,8 +1154,7 @@ def process_price():
                         retracement_ratio_str = f"{retracement_ratio:.2%}"
                     log(
                         f"[止盈止损状态] {cur_pos} | 当前盈亏:{pr:.2%} | 最高盈利:{cur_max_profit_pct:.2%} | "
-                        f"盈利>0.02%:{'✅' if cond_profit_valid else '❌'} | "
-                        f"超20秒无新高:{'✅' if cond_no_new_high else '❌'} | "
+                        f"持仓:{hold_time:.0f}秒 | 允许止损:{allow_stop} | 允许回撤:{allow_trailing} | "
                         f"回撤比(当前/最高):{retracement_ratio_str}≤70%:{'✅' if cond_retracement_70 else '❌'} | "
                         f"距最高盈利时间:{time_since_max:.1f}秒"
                     )
@@ -1196,7 +1233,7 @@ def on_message(ws, msg):
             return
         # 标记价格更新：核心价格数据源
         if data.get("e") == "markPriceUpdate":
-            raw_price = float(data["p"]);
+            raw_price = float(data["p"])
             current_price = raw_price
             with lock:
                 price_buffer.append(raw_price)
@@ -1207,12 +1244,12 @@ def on_message(ws, msg):
             trade_queue.put("PROCESS")
         # 盘口深度更新
         if data.get("e") == "depthUpdate":
-            orderbook["bids"] = data["b"];
+            orderbook["bids"] = data["b"]
             orderbook["asks"] = data["a"]
         # 逐笔成交更新
         if data.get("e") == "aggTrade":
             last_trade_side = "sell" if data["m"] else "buy"
-            raw_price = float(data["p"]);
+            raw_price = float(data["p"])
             current_price = raw_price
             # 更新最近5笔带量成交
             update_trade_volume(last_trade_side, data["q"])
@@ -1234,7 +1271,8 @@ def on_message(ws, msg):
                     "volume": float(k_data["v"])
                 }
                 kline_1m_closed.append(new_k)
-                if len(kline_1m_closed) > 3:
+                # 🔥 核心修改4：扩大缓存以支持取5根K线计算挂单
+                if len(kline_1m_closed) > 5:
                     kline_1m_closed.pop(0)
     except Exception as e:
         # 解析异常也更新心跳，避免误判断连
@@ -1296,7 +1334,7 @@ def start_ws():
 if __name__ == "__main__":
     log("======================================")
     mode_str = "本地撮合 (实盘行情)" if USE_LOCAL_SIMULATION else "API真实查询 (测试网)"
-    log(f"        V18 专业优化版 启动成功")
+    log(f"        V19 终极防洗版 启动成功")
     log(f"        当前运行模式: {mode_str}")
     log(f"        仓位控制: 总资金 {POSITION_RATIO * 100:.0f}% 动态开仓")
     log("======================================")
