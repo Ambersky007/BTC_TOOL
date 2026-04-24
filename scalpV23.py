@@ -46,8 +46,8 @@ BASE_URL_TESTNET = "https://testnet.binancefuture.com"
 WS_URL_TESTNET = "wss://stream.binancefuture.com/stream"
 BASE_URL_REAL = "https://fapi.binance.com"
 WS_URL_REAL = "wss://fstream.binance.com/stream"
-BASE_URL = BASE_URL_TESTNET if USE_LOCAL_SIMULATION else BASE_URL_REAL
-WS_URL = WS_URL_TESTNET if USE_LOCAL_SIMULATION else WS_URL_REAL
+BASE_URL = BASE_URL_REAL
+WS_URL = WS_URL_REAL
 SYMBOL = "BTCUSDT"
 WS_SYMBOL = "btcusdt"
 QTY = 0.01
@@ -68,7 +68,7 @@ FAST_CANCEL_SEC = 2
 cooldown_until = 0
 COOLDOWN_SEC = 2
 # V23 核心参数
-SCALP_SL = 0.015  # 1.5% 硬止损
+SCALP_SL = 0.025  # 2.5% 绝对价格比例兜底硬止损
 MIN_TP_PNL = 0.0006  # 0.06% 最小保底止盈门槛，必须覆盖手续费
 MIN_TP_MAX_PROFIT = 0.0006  # 0.06% 流动性止盈必须达到的最高盈利门槛
 ZONE_VALIDITY_SEC = 120  # 基础时效，实际将由动态函数覆盖
@@ -751,7 +751,7 @@ def detect_range():
         score5 = 10 if zone_touch >= 2 else 5
         total_score = score1 + score2 + score3 + score4 + score5
         current_zone_score = total_score
-        return total_score >= 50
+        return total_score >= 65
 
 
 def detect_state_pipeline():
@@ -761,7 +761,7 @@ def detect_state_pipeline():
 
 
 # ======================
-# V23 开仓条件诊断雷达
+# V23 开仓条件诊断雷达 (修正盈亏比计算逻辑)
 # ======================
 def log_entry_conditions():
     global last_entry_log_time
@@ -773,7 +773,7 @@ def log_entry_conditions():
         cond1_5k = False
         if kline_len >= 5 and atr > 0:
             bodies = [abs(k['close'] - k['open']) for k in kline_1m_closed[-5:]]
-            small_count = sum(1 for b in bodies if b < atr * 0.7)
+            small_count = sum(1 for b in bodies if b < atr * 1.1)
             cond1_5k = small_count >= 3
     state_pipeline = detect_state_pipeline()
     is_range_code = state_pipeline == "range"
@@ -784,18 +784,27 @@ def log_entry_conditions():
     if liquidity_zone: zone_width = liquidity_zone.high - liquidity_zone.low
     cond2_zone_width = zone_width >= PRICE_STEP * 2
     cond2 = cond2_kline and cond2_atr and cond2_zone_width
+    # ================= 盈亏比核心修正 =================
     rr_ratio = 0.0
     cond3 = False
-    required_width = 0.0
     if liquidity_zone and raw_price and raw_price > 0:
-        stop_distance = raw_price * SCALP_SL
-        rr_ratio = zone_width / stop_distance if stop_distance > 0 else 0
+        # 1. 预期止盈：价格走到区间对侧，盈利为区间宽度
+        tp_pct = zone_width / raw_price
+        tp_roi = tp_pct * LEVERAGE
+        # 2. 预期止损：剃头皮微观止损，紧贴区间边缘(至少4个步阶或区间宽度的20%)
+        stop_offset = max(PRICE_STEP * 4, zone_width * 0.2)
+        sl_pct = stop_offset / raw_price
+        sl_roi = sl_pct * LEVERAGE
+        # 3. 真实盈亏比 = 止盈ROI / 止损ROI (因为杠杆同乘同除，等于宽度/止损偏移)
+        rr_ratio = tp_roi / sl_roi if sl_roi > 0 else 0
+        # 4. 高频策略盈亏比门槛放宽
         if zone_width < PRICE_STEP * 6:
             cond3 = False
         elif zone_width < PRICE_STEP * 20:
-            cond3 = rr_ratio >= 1.1
+            cond3 = rr_ratio >= 1.0
         else:
-            cond3 = rr_ratio >= 1.3
+            cond3 = rr_ratio >= 1.2
+    # ================= 修正结束 =================
     cond4_long = raw_price <= (liquidity_zone.low + PRICE_STEP * 2) if liquidity_zone else False
     cond4_short = raw_price >= (liquidity_zone.high - PRICE_STEP * 2) if liquidity_zone else False
     cond4 = cond4_long or cond4_short
@@ -814,7 +823,7 @@ def log_entry_conditions():
     all_short = is_range_code and cond2 and cond3 and cond4_short and cond5_short and cond6
     log(f"[开仓雷达] 1.震荡市:代码{'✅' if is_range_code else '❌'}(评分:{current_zone_score}) | 5K{'✅' if cond1_5k else '❌'} | "
         f"2.基础{'✅' if cond2 else '❌'}(K:{kline_len} A:{atr:.1f} W:{zone_width:.1f}) | "
-        f"3.盈亏比{'✅' if cond3 else '❌'}({rr_ratio:.2f}≥1.3 需W>{required_width:.1f}) | "
+        f"3.盈亏比{'✅' if cond3 else '❌'}(RR:{rr_ratio:.2f}) | "
         f"4.靠轨{'✅' if cond4 else '❌'}(多:{'✅' if cond4_long else '❌'} 空:{'✅' if cond4_short else '❌'}) | "
         f"5.过滤{'✅' if cond5 else '❌'}(偏:{bias} 触:{touch_count} 向:{last_trade_side}) | "
         f"6.时效{'✅' if cond6 else '❌'}(剩:{zone_remaining_sec:.0f}s) | "
@@ -860,42 +869,41 @@ def scalp_entry():
     if detect_state_pipeline() != "range": return
     if not liquidity_zone: return
     if time.time() - liquidity_zone.creation_time > liquidity_zone.validity_window: return
-    buy_price, sell_price = get_smart_entry_prices()
-    if buy_price is None or sell_price is None: return
-    # 核心修复3：挂单防抢跑约束
+    price = raw_price
+    zone = liquidity_zone
+    bias = orderbook_bias()
+    exhaustion = detect_momentum_exhaustion()
+    # 动量过滤：大实体正在冲刺，不做单
     with data_lock:
         if len(kline_1m_closed) < 3: return
         last_3_closes = [k['close'] for k in kline_1m_closed[-3:]]
         min_close = min(last_3_closes)
         max_close = max(last_3_closes)
-    # 多单约束：不高于近3根K线最低收盘价，且必须大于区间下轨
-    long_allowed = (buy_price <= min_close) and (liquidity_zone and buy_price >= liquidity_zone.low)
-    # 空单约束：不低于近3根K线最高收盘价，且必须小于区间上轨
-    short_allowed = (sell_price >= max_close) and (liquidity_zone and sell_price <= liquidity_zone.high)
-    price = raw_price
-    zone = liquidity_zone
-    bias = orderbook_bias()
-    width = zone.high - zone.low
-    offset = max(5, width * 0.1)
-    exhaustion = detect_momentum_exhaustion()
-    with data_lock:
         if len(kline_1m_closed) >= 1:
             last_k = kline_1m_closed[-1]
             body = abs(last_k['close'] - last_k['open'])
             if not exhaustion and body > atr * 0.7: return
-    sweep = detect_sweep(price, prev_price_v23, zone)
-    if sweep == "down_sweep" and price > zone.low:
-        if long_allowed:  # 应用约束
-            if buy_price < price:
-                current_entry_strategy = "V23假跌破反转"
-                send_limit_order("BUY", buy_price)
-                return
-    if sweep == "up_sweep" and price < zone.high:
-        if short_allowed:  # 应用约束
-            if sell_price > price:
-                current_entry_strategy = "V23假突破反转"
-                send_limit_order("SELL", sell_price)
-                return
+    # ================= 核心改造：轨外10U挂单逻辑 =================
+    # 做空（高抛）挂单价：
+    # 基准是近3根K线最高收盘价。如果没破上轨，强行挂在上轨+10U；如果已破上轨，挂在最高收盘价
+    if max_close < zone.high:
+        sell_price = zone.high + 10.0
+    else:
+        sell_price = max_close
+    sell_price = normalize_price(sell_price)
+    # 做多（低吸）挂单价：
+    # 基准是近3根K线最低收盘价。如果没破下轨，强行挂在下轨-10U；如果已破下轨，挂在最低收盘价
+    if min_close > zone.low:
+        buy_price = zone.low - 10.0
+    else:
+        buy_price = min_close
+    buy_price = normalize_price(buy_price)
+    # ================= 合法性约束 =================
+    # 挂空单价格必须大于当前现价（不能追高成市价单），且必须在上轨之外
+    short_allowed = (sell_price > price) and (sell_price > zone.high)
+    # 挂多单价格必须小于当前现价（不能杀跌成市价单），且必须在下轨之外
+    long_allowed = (buy_price < price) and (buy_price < zone.low)
+    # ================= 区间评分与仓位管理 =================
     notional_multiplier = 1.0
     if current_zone_score >= 70:
         notional_multiplier = 1.0
@@ -904,29 +912,24 @@ def scalp_entry():
         notional_multiplier = 0.5
         strategy_suffix = "试探区"
     else:
-        return
+        return  # 评分太低不开仓
     custom_qty = get_dynamic_qty(price, ratio=POSITION_RATIO, notional_multiplier=notional_multiplier)
-    if price < zone.low:
-        pass
-    elif price <= zone.low + PRICE_STEP * 2:
+    # ================= 开仓执行逻辑 =================
+    # 靠近下轨区域，尝试做多
+    if price <= zone.low + PRICE_STEP * 5:  # 放宽触发距离，只要靠近下轨就开始挂单
         if zone.touch_count >= 1 and (
                 bias != "bear" or detect_absorption() or exhaustion) and last_trade_side != "sell":
-            if not long_allowed: return  # 应用约束
-            if buy_price >= price: return
-            if buy_price < zone.low - offset: return
-            current_entry_strategy = f"V23智能低吸({strategy_suffix}评分{current_zone_score})"
-            send_limit_order("BUY", buy_price, custom_qty=custom_qty)
-            return
-    if price > zone.high:
-        pass
-    elif price >= zone.high - PRICE_STEP * 2:
+            if long_allowed:
+                current_entry_strategy = f"V23低吸-轨外10U({strategy_suffix}评分{current_zone_score})"
+                send_limit_order("BUY", buy_price, custom_qty=custom_qty)
+                return
+    # 靠近上轨区域，尝试做空
+    if price >= zone.high - PRICE_STEP * 5:
         if zone.touch_count >= 1 and (bias != "bull" or detect_absorption() or exhaustion) and last_trade_side != "buy":
-            if not short_allowed: return  # 应用约束
-            if sell_price <= price: return
-            if sell_price > zone.high + offset: return
-            current_entry_strategy = f"V23智能高抛({strategy_suffix}评分{current_zone_score})"
-            send_limit_order("SELL", sell_price, custom_qty=custom_qty)
-            return
+            if short_allowed:
+                current_entry_strategy = f"V23高抛-轨外10U({strategy_suffix}评分{current_zone_score})"
+                send_limit_order("SELL", sell_price, custom_qty=custom_qty)
+                return
 
 
 # 核心修复6：提前止损检测
@@ -1153,7 +1156,7 @@ def process_price():
         else:
             if USE_LOCAL_SIMULATION:
                 pnl_abs = (snap_price - cur_ep) * actual_position_amt if cur_pos == "long" else (
-                                                                                                            cur_ep - snap_price) * actual_position_amt
+                                                                                                        cur_ep - snap_price) * actual_position_amt
                 margin = abs(actual_position_amt) * cur_ep / LEVERAGE if LEVERAGE > 0 else 0
                 pr = pnl_abs / margin if margin > 0 else 0
                 if pr <= -SCALP_SL:
@@ -1166,7 +1169,7 @@ def process_price():
                 local_max_price = cur_max_price;
                 local_min_price = cur_min_price
                 max_pnl_abs = (cur_max_price - cur_ep) * actual_position_amt if cur_pos == "long" else (
-                                                                                                                   cur_ep - cur_min_price) * actual_position_amt
+                                                                                                               cur_ep - cur_min_price) * actual_position_amt
                 max_profit_pct = max_pnl_abs / margin if margin > 0 else 0
             else:
                 with lock:
@@ -1185,7 +1188,7 @@ def process_price():
                     min_price_since_entry = cur_min_price
                 pr = off_pnl / off_margin if off_margin > 0 else 0
                 max_pnl_abs = (cur_max_price - cur_ep) * actual_position_amt if cur_pos == "long" else (
-                                                                                                                   cur_ep - cur_min_price) * actual_position_amt
+                                                                                                               cur_ep - cur_min_price) * actual_position_amt
                 margin = abs(actual_position_amt) * cur_ep / LEVERAGE if LEVERAGE > 0 else 0
                 max_profit_pct = max_pnl_abs / margin if margin > 0 else 0
             status_parts = []
@@ -1200,7 +1203,7 @@ def process_price():
                         status_parts.append(
                             f"微利追踪(等待🟡 最高ROI:{max_profit_pct:.2%}<{MIN_ROI_COVER_FEE * 1.2 * 100:.1f}%)")
                     else:
-                        trail_tp = (time_since_high >= 20) and (retracement <= 0.65)
+                        trail_tp = (time_since_high >= 5) or (retracement <= 0.85)  # 7秒没增大或者回撤15%
                         status_parts.append(
                             f"极速追踪({'触发🔴' if trail_tp else '等待🟡'} 历高停顿{time_since_high:.0f}s/20s 回撤比{retracement:.2%}/65%)")
                         if trail_tp:

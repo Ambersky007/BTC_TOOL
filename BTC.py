@@ -1223,6 +1223,7 @@ def on_message(ws, msg):
     global orderbook, raw_price, current_price, last_trade_side, last_ws_time, kline_1m_closed
     # 更新心跳时间：只要收到数据就说明连接正常
     last_ws_time = time.time()
+    #print("WS收到:", msg[:200])
     try:
         data = json.loads(msg)
         # 币安组合流：提取真实数据

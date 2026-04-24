@@ -1,6 +1,5 @@
 # -*- coding: utf-8 -*-
-
-#根据胜率动态仓位
+# 根据胜率动态仓位 - V24高频极速版
 import websocket
 import json
 import time
@@ -47,19 +46,19 @@ BASE_URL_TESTNET = "https://testnet.binancefuture.com"
 WS_URL_TESTNET = "wss://stream.binancefuture.com/stream"
 BASE_URL_REAL = "https://fapi.binance.com"
 WS_URL_REAL = "wss://fstream.binance.com/stream"
-BASE_URL = BASE_URL_TESTNET if USE_LOCAL_SIMULATION else BASE_URL_REAL
-WS_URL = WS_URL_TESTNET if USE_LOCAL_SIMULATION else WS_URL_REAL
+BASE_URL = BASE_URL_REAL
+WS_URL = WS_URL_REAL
 SYMBOL = "BTCUSDT"
 WS_SYMBOL = "btcusdt"
 QTY = 0.01
 # ======================
-# 策略参数 (V23-流动性实盘 - 剃头皮微利版)
+# 策略参数 (V24-高频流动性实盘版)
 # ======================
 WINDOW = 10
 ORDER_TIMEOUT = 200
 RANGE_ORDER_TIMEOUT = 200
 SLIPPAGE = 5
-PRICE_STEP = 5  # 或10
+PRICE_STEP = 5
 MAX_CONTINUOUS_LOSS = 3
 LOSS_RESET_SEC = 180
 last_ws_time = 0
@@ -68,10 +67,10 @@ trade_buffer = []
 FAST_CANCEL_SEC = 2
 cooldown_until = 0
 COOLDOWN_SEC = 2
-# V23 核心参数
-SCALP_SL = 0.0008  # 0.08% 硬止损
-MIN_TP_PNL = 0.0006  # 0.06% 最小保底止盈门槛，必须覆盖手续费
-MIN_TP_MAX_PROFIT = 0.0006  # 0.06% 流动性止盈必须达到的最高盈利门槛
+# V24 核心参数
+SCALP_SL = 0.015  # 1.5% 绝对价格比例兜底硬止损 (基于Mark价格防插针)
+MIN_TP_PNL = 0.0006
+MIN_TP_MAX_PROFIT = 0.0006
 ZONE_VALIDITY_SEC = 120
 # ======================
 # 全局变量 - API模式
@@ -112,12 +111,16 @@ j_list = []
 trade_volume_buffer = []
 kline_1m_closed = []
 kline_15m_closed = []
-processing = False
+last_process_time = 0.0
+PROCESS_INTERVAL = 0.2
 trade_queue = queue.Queue()
 max_profit_pct = 0.0
 max_price_since_entry = 0.0
 min_price_since_entry = 999999.0
 time_at_max_profit = 0.0
+official_unrealized_profit = 0.0
+official_isolated_margin = 0.0
+listenKey = None
 # ======================
 # 全局变量 - 本地撮合模式
 # ======================
@@ -136,28 +139,39 @@ actual_position_amt = QTY
 INITIAL_BALANCE = 10000.0
 POSITION_RATIO = 0.3
 LOT_SIZE = 0.001
+FIXED_NOTIONAL = 300.0
 account_balance = INITIAL_BALANCE
 current_entry_strategy = ""
-current_zone_score = 0  # 🚀 新增：记录当前区间评分
+current_zone_score = 0
 
 
 # ======================
-# V23 流动性结构系统
+# V24 流动性结构系统
 # ======================
+def get_dynamic_zone_validity(atr):
+    if atr < 50:
+        return 180
+    elif atr < 120:
+        return 120
+    else:
+        return 60
+
+
 class LiquidityZone:
-    def __init__(self, high, low):
+    def __init__(self, high, low, atr=0):
         self.high = high
         self.low = low
         self.touch_count = 0
         self.swept_up = False
         self.swept_down = False
         self.creation_time = time.time()
-        self.validity_window = ZONE_VALIDITY_SEC
+        self.validity_window = get_dynamic_zone_validity(atr)
 
 
 liquidity_zone = None
 prev_price_v23 = None
 ws_app = None
+user_data_ws_app = None
 
 
 # ======================
@@ -197,9 +211,13 @@ def normalize_price(price):
 # ======================
 # 动态仓位与余额
 # ======================
-def get_dynamic_qty(price, ratio=POSITION_RATIO):
-    if not price or price <= 0 or account_balance <= 0: return LOT_SIZE
-    target_notional = account_balance * ratio
+def get_dynamic_qty(price, ratio=POSITION_RATIO, notional_multiplier=1.0):
+    if not price or price <= 0: return LOT_SIZE
+    if FIXED_NOTIONAL and FIXED_NOTIONAL > 0:
+        target_notional = FIXED_NOTIONAL * notional_multiplier
+    else:
+        if account_balance <= 0: return LOT_SIZE
+        target_notional = account_balance * ratio
     raw_qty = target_notional / price
     steps = math.floor(raw_qty / LOT_SIZE)
     final_qty = steps * LOT_SIZE
@@ -321,7 +339,7 @@ def fetch_initial_klines():
 # 持仓/下单/撤单/平仓
 # ======================
 def sync_position():
-    global position, entry_price, active_order, actual_position_amt
+    global position, entry_price, active_order, actual_position_amt, official_unrealized_profit, official_isolated_margin
     if USE_LOCAL_SIMULATION:
         if local_position:
             log(f"[本地持仓] {local_position} | 均价:{local_entry_price}")
@@ -348,11 +366,15 @@ def sync_position():
                         entry_price = ep
                         actual_position_amt = abs(amt)
                         active_order = None
-                        log(f"[API持仓] {position} | 数量:{actual_position_amt} | 均价:{entry_price}")
+                        official_unrealized_profit = float(item['unRealizedProfit'])
+                        official_isolated_margin = float(item['isolatedMargin'])
+                        log(f"[API持仓] {position} | 数量:{actual_position_amt} | 均价:{ep} | 官方未实现盈亏:{official_unrealized_profit}")
                     else:
                         position = None
                         entry_price = 0
                         actual_position_amt = QTY
+                        official_unrealized_profit = 0.0
+                        official_isolated_margin = 0.0
                         log("[API持仓] None")
     except Exception as e:
         log(f"[持仓同步失败] {e}")
@@ -370,14 +392,22 @@ def position_monitor():
                     pos = position;
                     ep = entry_price
             if pos and ep > 0:
-                with data_lock:
-                    price = raw_price if (raw_price and time.time() - last_aggTrade_time <= 3) else mark_price
-                    if not price: price = ep
-                amt = actual_position_amt
-                pnl = (price - ep) * amt if pos == "long" else (ep - price) * amt
-                margin = abs(amt) * ep / LEVERAGE if LEVERAGE > 0 else 0
-                roi = pnl / margin if margin > 0 else 0
-                log(f"[账户监控] {pos} | 数量:{amt} | 均价:{ep:.1f} | 现价:{price:.1f} | 浮盈:{pnl:.2f}U | ROI:{roi:.2%}")
+                if USE_LOCAL_SIMULATION:
+                    with data_lock:
+                        price = raw_price if (raw_price and time.time() - last_aggTrade_time <= 3) else mark_price
+                        if not price: price = ep
+                    position_notional = actual_position_amt * ep
+                    margin = position_notional / LEVERAGE if LEVERAGE > 0 else 0
+                    price_change_pct = (price - ep) / ep if pos == "long" else (ep - price) / ep
+                    pr = price_change_pct * LEVERAGE
+                    pnl_abs = margin * pr
+                    log(f"[本地账户监控] {pos} | 均价:{ep:.1f} | 现价:{price:.1f} | Mark:{mark_price:.1f} | 浮盈:{pnl_abs:.2f}U | ROI:{pr:.2%}")
+                else:
+                    with lock:
+                        off_pnl = official_unrealized_profit
+                        off_margin = official_isolated_margin
+                    roi = off_pnl / off_margin if off_margin > 0 else 0
+                    log(f"[实盘账户监控] {pos} | 均价:{ep:.1f} | 官方浮盈:{off_pnl:.2f}U | 官方ROI:{roi:.2%}")
             else:
                 log("[账户监控] 无持仓")
         except Exception as e:
@@ -400,6 +430,7 @@ def send_limit_order(side, price, reduce=False, custom_qty=None):
     trade_lock = True;
     partial_filled_flag = False
     order_qty = custom_qty if custom_qty else (get_dynamic_qty(price) if not reduce else actual_position_amt)
+    actual_notional = order_qty * price
     if order_qty <= 0: trade_lock = False; return
     url = f"{BASE_URL}/fapi/v1/order"
     p = {
@@ -417,7 +448,7 @@ def send_limit_order(side, price, reduce=False, custom_qty=None):
             active_order = res["orderId"];
             order_time = time.time();
             order_price = price
-            log(f"✅ API挂单成功 {res} | 数量:{order_qty} | 平仓单:{reduce}")
+            log(f"✅ API挂单成功 {res} | 数量:{order_qty} | 名义金额:{actual_notional:.2f}U | 平仓单:{reduce}")
         else:
             log(f"❌ API挂单失败返回: {res}");
             trade_lock = False
@@ -523,6 +554,12 @@ def check_order_timeout():
             if time.time() - order_time > timeout: cancel_order()
 
 
+def is_price_valid():
+    if not raw_price or not mark_price: return False
+    diff = abs(raw_price - mark_price) / raw_price
+    return diff < 0.0005
+
+
 def check_order_filled():
     global local_active_order, local_position, local_entry_price, local_trade_lock
     global local_max_profit_pct, local_max_price, local_min_price
@@ -534,13 +571,13 @@ def check_order_filled():
         side, price_str = local_active_order.split("_")
         order_p = float(price_str)
         filled = False
-        with data_lock:
-            check_price = raw_price if (raw_price and time.time() - last_aggTrade_time <= 3) else mark_price
-            if not check_price: check_price = raw_price
-        if side == "BUY" and check_price <= order_p:
-            filled = True
-        elif side == "SELL" and check_price >= order_p:
-            filled = True
+        if is_price_valid():
+            with data_lock:
+                check_price = raw_price
+            if side == "BUY" and check_price and check_price <= order_p:
+                filled = True
+            elif side == "SELL" and check_price and check_price >= order_p:
+                filled = True
         is_reduce = (side == "SELL" and local_position == "long") or (side == "BUY" and local_position == "short")
         if filled:
             if is_reduce:
@@ -611,27 +648,28 @@ def check_order_filled():
 
 
 # ======================
-# V23 流动性核心引擎
+# V24 流动性核心引擎 (1分钟K线识别+入场)
 # ======================
 def update_liquidity_zone():
     global liquidity_zone
     with data_lock:
-        if len(kline_1m_closed) < 10: return
-        highs = [k['high'] for k in kline_1m_closed[-10:]]
-        lows = [k['low'] for k in kline_1m_closed[-10:]]
+        if len(kline_1m_closed) < 7: return
+        highs = [k['high'] for k in kline_1m_closed[-7:]]
+        lows = [k['low'] for k in kline_1m_closed[-7:]]
         new_high = max(highs);
         new_low = min(lows)
+        atr = compute_atr(kline_1m_closed, 7)
         if liquidity_zone:
             is_expired = (time.time() - liquidity_zone.creation_time) > liquidity_zone.validity_window
             drifted = abs(new_high - liquidity_zone.high) > PRICE_STEP * 5 or abs(
                 new_low - liquidity_zone.low) > PRICE_STEP * 5
             if is_expired or drifted:
-                liquidity_zone = LiquidityZone(new_high, new_low)
+                liquidity_zone = LiquidityZone(new_high, new_low, atr)
             else:
                 liquidity_zone.high = new_high;
                 liquidity_zone.low = new_low
         else:
-            liquidity_zone = LiquidityZone(new_high, new_low)
+            liquidity_zone = LiquidityZone(new_high, new_low, atr)
 
 
 def detect_sweep(price, prev_price, zone):
@@ -662,75 +700,54 @@ def detect_breakout():
 
 
 def detect_touch(price, prev_price, zone):
-    if not zone or not prev_price:
-        return False
+    if not zone or not prev_price: return False
     buffer = 30
-    if price > zone.high and prev_price <= zone.high:
-        return True
-    if price < zone.low and prev_price >= zone.low:
-        return True
-    if abs(price - zone.high) <= buffer:
-        return True
-    if abs(price - zone.low) <= buffer:
-        return True
+    if price > zone.high and prev_price <= zone.high: return True
+    if price < zone.low and prev_price >= zone.low: return True
+    if abs(price - zone.high) <= buffer: return True
+    if abs(price - zone.low) <= buffer: return True
     return False
 
 
-# 🚀🚀🚀 核心升级：区间质量评分系统 🚀🚀🚀
 def detect_range():
     global current_zone_score
     with data_lock:
-        if len(kline_1m_closed) < 10:
+        if len(kline_1m_closed) < 7:
             current_zone_score = 0
             return False
-
-        highs = [k['high'] for k in kline_1m_closed[-10:]]
-        lows = [k['low'] for k in kline_1m_closed[-10:]]
+        highs = [k['high'] for k in kline_1m_closed[-7:]]
+        lows = [k['low'] for k in kline_1m_closed[-7:]]
         range_high = max(highs)
         range_low = min(lows)
         range_width = range_high - range_low
         atr = compute_atr(kline_1m_closed, 7)
-
         if atr <= 0 or range_width <= 0:
             current_zone_score = 0
             return False
-
-        # 🧠 评分1：区间宽度合理性（动态ATR锚定）
         score1 = 0
         if atr * 2 <= range_width <= atr * 6:
-            score1 = 25  # 优质震荡宽度
+            score1 = 25
         elif range_width < atr * 2:
-            score1 = 10  # 太窄，噪音大
+            score1 = 10
         else:
-            score1 = 5  # 太宽，趋势风险
-
-        # 🧠 评分2：触碰次数（结构稳定性）
+            score1 = 5
         tolerance = 30
-        touch_high = sum(1 for k in kline_1m_closed[-10:] if abs(k['high'] - range_high) <= tolerance)
-        touch_low = sum(1 for k in kline_1m_closed[-10:] if abs(k['low'] - range_low) <= tolerance)
+        touch_high = sum(1 for k in kline_1m_closed[-7:] if abs(k['high'] - range_high) <= tolerance)
+        touch_low = sum(1 for k in kline_1m_closed[-7:] if abs(k['low'] - range_low) <= tolerance)
         total_touch = touch_high + touch_low
-        score2 = 25 if total_touch >= 4 else (15 if total_touch >= 2 else 5)
-
-        # 🧠 评分3：波动均匀性（小实体占比）
-        bodies = [abs(k['close'] - k['open']) for k in kline_1m_closed[-10:]]
+        score2 = 25 if total_touch >= 3 else (15 if total_touch >= 2 else 5)
+        bodies = [abs(k['close'] - k['open']) for k in kline_1m_closed[-7:]]
         small_bodies = sum(1 for b in bodies if b < atr * 0.5)
-        score3 = 20 if small_bodies >= 6 else (10 if small_bodies >= 3 else 5)
-
-        # 🧠 评分4：方向一致性（防止单边中继假震荡）
-        ups = sum(1 for k in kline_1m_closed[-10:] if k['close'] > k['open'])
-        downs = 10 - ups
-        up_down_bias = abs(ups - downs) / 10.0
-        score4 = 20 if up_down_bias < 0.3 else 5  # 阴阳比必须均衡
-
-        # 🧠 评分5：流动性稳定性（基于Zone触碰）
+        score3 = 20 if small_bodies >= 4 else (10 if small_bodies >= 2 else 5)
+        ups = sum(1 for k in kline_1m_closed[-7:] if k['close'] > k['open'])
+        downs = 7 - ups
+        up_down_bias = abs(ups - downs) / 7.0
+        score4 = 20 if up_down_bias < 0.3 else 5
         zone_touch = liquidity_zone.touch_count if liquidity_zone else 0
         score5 = 10 if zone_touch >= 2 else 5
-
         total_score = score1 + score2 + score3 + score4 + score5
         current_zone_score = total_score
-
-        # 👉 决策逻辑：<50分不碰，>=50分视为震荡
-        return total_score >= 50
+        return total_score >= 30  # 修改：降低门槛至30
 
 
 def detect_state_pipeline():
@@ -740,51 +757,46 @@ def detect_state_pipeline():
 
 
 # ======================
-# V23 开仓条件诊断雷达
+# V24 开仓条件与价格约束系统 (高频优化版)
 # ======================
 def log_entry_conditions():
     global last_entry_log_time
     now = time.time()
-    if now - last_entry_log_time < 2:
-        return
+    if now - last_entry_log_time < 2: return
     with data_lock:
         kline_len = len(kline_1m_closed)
         atr = compute_atr(kline_1m_closed, 7) if kline_len >= 7 else 0.0
-        cond1_5k = False
-        if kline_len >= 5 and atr > 0:
-            bodies = [abs(k['close'] - k['open']) for k in kline_1m_closed[-5:]]
-            small_count = sum(1 for b in bodies if b < atr * 0.7)
-            cond1_5k = small_count >= 3
-
     state_pipeline = detect_state_pipeline()
     is_range_code = state_pipeline == "range"
     update_liquidity_zone()
     cond2_kline = kline_len >= 7
-    cond2_atr = atr > 0
+    cond2_atr = atr > 0  # 修改：只要ATR有值即可
     zone_width = 0.0
-    if liquidity_zone:
-        zone_width = liquidity_zone.high - liquidity_zone.low
-    cond2_zone_width = zone_width >= PRICE_STEP * 2
+    if liquidity_zone: zone_width = liquidity_zone.high - liquidity_zone.low
+    cond2_zone_width = zone_width >= 30  # 修改：宽度大于30即可
     cond2 = cond2_kline and cond2_atr and cond2_zone_width
     rr_ratio = 0.0
     cond3 = False
-    required_width = 0.0
     if liquidity_zone and raw_price and raw_price > 0:
-        stop_distance = raw_price * SCALP_SL
-        rr_ratio = zone_width / stop_distance if stop_distance > 0 else 0
-        if zone_width < PRICE_STEP * 6:
-            cond3 = False
-        elif zone_width < PRICE_STEP * 20:
-            cond3 = rr_ratio >= 1.1
+        # 修改：基于微观结构的 ROI 计算盈亏比
+        tp_pct = zone_width / raw_price
+        tp_roi = tp_pct * LEVERAGE
+        stop_offset = max(PRICE_STEP * 4, zone_width * 0.2)
+        sl_pct = stop_offset / raw_price
+        sl_roi = sl_pct * LEVERAGE
+        rr_ratio = tp_roi / sl_roi if sl_roi > 0 else 0
+        if zone_width < 50:
+            cond3 = rr_ratio >= 0.8
         else:
-            cond3 = rr_ratio >= 1.3
+            cond3 = rr_ratio >= 1.0
     cond4_long = raw_price <= (liquidity_zone.low + PRICE_STEP * 2) if liquidity_zone else False
     cond4_short = raw_price >= (liquidity_zone.high - PRICE_STEP * 2) if liquidity_zone else False
     cond4 = cond4_long or cond4_short
     bias = orderbook_bias()
     touch_count = liquidity_zone.touch_count if liquidity_zone else 0
-    cond5_long = (touch_count >= 1) and (bias != "bear" or detect_absorption()) and (last_trade_side != "sell")
-    cond5_short = (touch_count >= 1) and (bias != "bull" or detect_absorption()) and (last_trade_side != "buy")
+    # 修改：移除 last_trade_side 鸡肋过滤
+    cond5_long = (touch_count >= 1) and (bias != "bear" or detect_absorption())
+    cond5_short = (touch_count >= 1) and (bias != "bull" or detect_absorption())
     cond5 = cond5_long or cond5_short
     zone_remaining_sec = 0.0
     cond6 = False
@@ -794,13 +806,11 @@ def log_entry_conditions():
         cond6 = elapsed <= liquidity_zone.validity_window
     all_long = is_range_code and cond2 and cond3 and cond4_long and cond5_long and cond6
     all_short = is_range_code and cond2 and cond3 and cond4_short and cond5_short and cond6
-
-    # 🚀 雷达新增区间评分显示
-    log(f"[开仓雷达] 1.震荡市:代码{'✅' if is_range_code else '❌'}(评分:{current_zone_score}) | 5K{'✅' if cond1_5k else '❌'} | "
-        f"2.基础{'✅' if cond2 else '❌'}(K:{kline_len} A:{atr:.1f} W:{zone_width:.1f}) | "
-        f"3.盈亏比{'✅' if cond3 else '❌'}({rr_ratio:.2f}≥1.3 需W>{required_width:.1f}) | "
-        f"4.靠轨{'✅' if cond4 else '❌'}(多:{'✅' if cond4_long else '❌'} 空:{'✅' if cond4_short else '❌'}) | "
-        f"5.过滤{'✅' if cond5 else '❌'}(偏:{bias} 触:{touch_count} 向:{last_trade_side}) | "
+    log(f"[开仓雷达] 1.1m震荡:代码{'✅' if is_range_code else '❌'}(评分:{current_zone_score}) | "
+        f"2.基础{'✅' if cond2 else '❌'}(W:{zone_width:.1f}) | "
+        f"3.盈亏比{'✅' if cond3 else '❌'}(RR:{rr_ratio:.2f}) | "
+        f"4.靠轨{'✅' if cond4 else '❌'} | "
+        f"5.过滤{'✅' if cond5 else '❌'} | "
         f"6.时效{'✅' if cond6 else '❌'}(剩:{zone_remaining_sec:.0f}s) | "
         f"==> 综合: 多{'🟢' if all_long else '🔴'} 空{'🟢' if all_short else '🔴'}")
     last_entry_log_time = now
@@ -808,134 +818,156 @@ def log_entry_conditions():
 
 def get_smart_entry_prices():
     with data_lock:
-        if len(kline_1m_closed) < 5:
-            return None, None
+        if len(kline_1m_closed) < 5: return None, None
         highs = [k['high'] for k in kline_1m_closed[-5:]]
         lows = [k['low'] for k in kline_1m_closed[-5:]]
-
     avg_high = sum(highs) / 5
     avg_low = sum(lows) / 5
     range_high = max(highs)
     range_low = min(lows)
-
     mid = (range_high + range_low) / 2
     width = range_high - range_low
-
     offset = max(5, width * 0.1)
-
     buy_price = avg_low + offset * 0.5
     buy_price = min(buy_price, mid - offset * 0.2)
-
     sell_price = avg_high - offset * 0.5
     sell_price = max(sell_price, mid + offset * 0.2)
-
+    # 修改：彻底移除阴阳线硬性安全距离约束，释放挂单空间
     return normalize_price(buy_price), normalize_price(sell_price)
 
 
 def detect_momentum_exhaustion():
     with data_lock:
-        if len(tick_buffer) < 5:
-            return False
+        if len(tick_buffer) < 5: return False
         diffs = [tick_buffer[i] - tick_buffer[i - 1] for i in range(1, len(tick_buffer))]
-        if not diffs or diffs[0] == 0:
-            return False
+        if not diffs or diffs[0] == 0: return False
         return abs(diffs[-1]) < abs(diffs[0]) * 0.5
 
 
 def scalp_entry():
     global current_entry_strategy
-    if detect_breakout(): return
-
+    # 修改：移除 detect_breakout 屏蔽，假突破需要突破前置条件
     atr = 0.0
     with data_lock:
         if len(kline_1m_closed) >= 7:
             atr = compute_atr(kline_1m_closed, 7)
-            if atr > PRICE_STEP * 20: return
-
+            # 修改：移除 if atr > PRICE_STEP * 20: return，高波动是高频获利朋友
     if detect_state_pipeline() != "range": return
     if not liquidity_zone: return
     if time.time() - liquidity_zone.creation_time > liquidity_zone.validity_window: return
-
     buy_price, sell_price = get_smart_entry_prices()
-    if buy_price is None or sell_price is None:
-        return
-
+    if buy_price is None or sell_price is None: return
+    with data_lock:
+        if len(kline_1m_closed) < 3: return
+        last_3_closes = [k['close'] for k in kline_1m_closed[-3:]]
+        min_close = min(last_3_closes)
+        max_close = max(last_3_closes)
+    long_allowed = (buy_price <= min_close) and (liquidity_zone and buy_price >= liquidity_zone.low)
+    short_allowed = (sell_price >= max_close) and (liquidity_zone and sell_price <= liquidity_zone.high)
     price = raw_price
     zone = liquidity_zone
     bias = orderbook_bias()
     width = zone.high - zone.low
     offset = max(5, width * 0.1)
     exhaustion = detect_momentum_exhaustion()
-
     with data_lock:
         if len(kline_1m_closed) >= 1:
             last_k = kline_1m_closed[-1]
             body = abs(last_k['close'] - last_k['open'])
             if not exhaustion and body > atr * 0.7: return
-
     sweep = detect_sweep(price, prev_price_v23, zone)
     if sweep == "down_sweep" and price > zone.low:
-        if buy_price < price:
-            current_entry_strategy = "V23假跌破反转"
-            send_limit_order("BUY", buy_price)
-            return
-
+        if long_allowed:
+            if buy_price < price:
+                current_entry_strategy = "V24假跌破反转"
+                send_limit_order("BUY", buy_price)
+                return
     if sweep == "up_sweep" and price < zone.high:
-        if sell_price > price:
-            current_entry_strategy = "V23假突破反转"
-            send_limit_order("SELL", sell_price)
-            return
-
-    # 🚀 根据评分系统动态调整仓位比例
-    qty_ratio = POSITION_RATIO  # 默认全仓比例(0.3)
+        if short_allowed:
+            if sell_price > price:
+                current_entry_strategy = "V24假突破反转"
+                send_limit_order("SELL", sell_price)
+                return
+    notional_multiplier = 1.0
     if current_zone_score >= 70:
-        qty_ratio = POSITION_RATIO  # 优质区间：满仓开
+        notional_multiplier = 1.0
         strategy_suffix = "优质区"
-    elif current_zone_score >= 50:
-        qty_ratio = POSITION_RATIO * 0.5  # 普通区间：半仓开（风控核心）
+    elif current_zone_score >= 30:  # 修改：放宽评分门槛至30
+        notional_multiplier = 0.5
         strategy_suffix = "试探区"
     else:
-        return  # 评分过低，理论上不会进这里(detect_range已拦截)，双保险
-
-    custom_qty = get_dynamic_qty(price, ratio=qty_ratio)
-
-    if price < zone.low:
-        pass
-    elif price <= zone.low + PRICE_STEP * 2:
-        if zone.touch_count >= 1 and (
-                bias != "bear" or detect_absorption() or exhaustion) and last_trade_side != "sell":
+        return
+    custom_qty = get_dynamic_qty(price, ratio=POSITION_RATIO, notional_multiplier=notional_multiplier)
+    if price < zone.high and price >= zone.high - PRICE_STEP * 2:
+        # 修改：移除 last_trade_side 鸡肋过滤
+        if zone.touch_count >= 1 and (bias != "bull" or detect_absorption() or exhaustion):
+            if not short_allowed: return
+            if sell_price <= price: return
+            if sell_price > zone.high + offset: return
+            current_entry_strategy = f"V24智能高抛({strategy_suffix})"
+            send_limit_order("SELL", sell_price, custom_qty=custom_qty)
+            return
+    if price > zone.low and price <= zone.low + PRICE_STEP * 2:
+        if zone.touch_count >= 1 and (bias != "bear" or detect_absorption() or exhaustion):
+            if not long_allowed: return
             if buy_price >= price: return
             if buy_price < zone.low - offset: return
-
-            current_entry_strategy = f"V23智能低吸({strategy_suffix}评分{current_zone_score})"
+            current_entry_strategy = f"V24智能低吸({strategy_suffix})"
             send_limit_order("BUY", buy_price, custom_qty=custom_qty)
             return
 
-    if price > zone.high:
-        pass
-    elif price >= zone.high - PRICE_STEP * 2:
-        if zone.touch_count >= 1 and (bias != "bull" or detect_absorption() or exhaustion) and last_trade_side != "buy":
-            if sell_price <= price: return
-            if sell_price > zone.high + offset: return
 
-            current_entry_strategy = f"V23智能高抛({strategy_suffix}评分{current_zone_score})"
-            send_limit_order("SELL", sell_price, custom_qty=custom_qty)
-            return
+def detect_aggressive_reversal():
+    if len(tick_buffer) < 10: return False
+    diffs = [tick_buffer[i] - tick_buffer[i - 1] for i in range(1, len(tick_buffer))]
+    cur_pos = local_position if USE_LOCAL_SIMULATION else position
+    if not cur_pos: return False
+    if cur_pos == "long":
+        reverse_ticks = sum(1 for d in diffs[-10:] if d < 0)
+    else:
+        reverse_ticks = sum(1 for d in diffs[-10:] if d > 0)
+    reverse_vol = 0.0
+    avg_vol = 0.0
+    with data_lock:
+        if len(kline_1m_closed) >= 3:
+            avg_vol = sum(k['volume'] for k in kline_1m_closed[-3:]) / 3
+    if cur_pos == "long":
+        for a in orderbook.get("asks", [])[:3]:
+            try:
+                reverse_vol += float(a[1])
+            except:
+                pass
+    else:
+        for b in orderbook.get("bids", [])[:3]:
+            try:
+                reverse_vol += float(b[1])
+            except:
+                pass
+    return reverse_ticks >= 8 and reverse_vol > avg_vol * 4
 
 
 def manage_position():
     if USE_LOCAL_SIMULATION:
         pos = local_position;
         ep = local_entry_price
+        if not pos: return False
+        if ep > 0 and mark_price:  # 核心修复：硬止损改用Mark价格，抗插针毛刺
+            stop_pnl = (mark_price - ep) / ep if pos == "long" else (ep - mark_price) / ep
+            if stop_pnl <= -SCALP_SL: close_position("V24硬止损(Mark防插针)"); return True
     else:
-        pos = position;
-        ep = entry_price
-    if not pos: return False
-    if ep > 0:
-        price = raw_price if (raw_price and time.time() - last_aggTrade_time <= 3) else mark_price
-        if not price: price = raw_price
-        pnl = (price - ep) / ep if pos == "long" else (ep - price) / ep
-        if pnl <= -SCALP_SL: close_position("V23硬止损"); return True
+        with lock:
+            pos = position;
+            off_pnl = official_unrealized_profit;
+            off_margin = official_isolated_margin
+        if not pos: return False
+        if off_margin > 0:
+            roi = off_pnl / off_margin
+            if roi <= -SCALP_SL:
+                close_position("V24硬止损(官方盈亏触发)")
+                return True
+    if detect_aggressive_reversal():
+        close_position("订单流提前止损")
+        return True
     return False
 
 
@@ -967,33 +999,40 @@ def save_trade_records():
 
 def close_position(reason):
     global loss_count, cooldown_until, loss_reset_time, entry_time, time_at_max_profit, current_entry_strategy
+    global official_unrealized_profit, official_isolated_margin
     if USE_LOCAL_SIMULATION:
         pos = local_position;
         ep = local_entry_price
+        if not pos: return
+        close_qty = actual_position_amt
+        with data_lock:
+            exit_price = raw_price if (raw_price and time.time() - last_aggTrade_time <= 3) else mark_price
+            if not exit_price: exit_price = raw_price
+        # 修改：基于 ROI 和保证金计算盈亏值
+        position_notional = close_qty * ep
+        margin = position_notional / LEVERAGE if LEVERAGE > 0 else 0
+        price_change_pct = (exit_price - ep) / ep if pos == "long" else (ep - exit_price) / ep
+        roi = price_change_pct * LEVERAGE
+        pnl_abs = margin * roi
+        if entry_time > 0:
+            record = {
+                "开仓时间": datetime.fromtimestamp(entry_time).strftime('%Y-%m-%d %H:%M:%S'),
+                "平仓时间": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                "开单策略": current_entry_strategy, "方向": "多" if pos == "long" else "空",
+                "数量(币)": close_qty, "名义价值(U)": round(position_notional, 2), "保证金(U)": round(margin, 2),
+                "开仓价格": ep, "平仓价格": exit_price,
+                "盈亏(U)": round(pnl_abs, 2), "收益率(ROI)": f"{roi:.2%}", "平仓原因": reason
+            }
+            trade_records.append(record)
+            save_trade_records()
     else:
         with lock:
             pos = position;
             ep = entry_price
-    if not pos: return
-    close_qty = actual_position_amt
-    with data_lock:
-        exit_price = raw_price if (raw_price and time.time() - last_aggTrade_time <= 3) else mark_price
-        if not exit_price: exit_price = raw_price
-    pnl = (exit_price - ep) / ep if pos == "long" else (ep - exit_price) / ep
-    if entry_time > 0:
-        pnl_abs = (exit_price - ep) * close_qty if pos == "long" else (ep - exit_price) * close_qty
-        margin = abs(close_qty) * ep / LEVERAGE if LEVERAGE > 0 else 0
-        roi = pnl_abs / margin if margin > 0 else 0
-        record = {
-            "开仓时间": datetime.fromtimestamp(entry_time).strftime('%Y-%m-%d %H:%M:%S'),
-            "平仓时间": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-            "开单策略": current_entry_strategy, "方向": "多" if pos == "long" else "空",
-            "数量": close_qty, "开仓价格": ep, "平仓价格": exit_price,
-            "盈亏(U)": round(pnl_abs, 2), "收益率": f"{roi:.2%}", "平仓原因": reason
-        }
-        trade_records.append(record)
-        save_trade_records()
-    if pnl < 0:
+            off_pnl_before = official_unrealized_profit
+        if not pos: return
+        close_qty = actual_position_amt
+    if "硬止损" in reason or "提前止损" in reason:
         loss_count += 1
         if loss_count >= MAX_CONTINUOUS_LOSS:
             cooldown_until = time.time() + 60
@@ -1001,7 +1040,7 @@ def close_position(reason):
             loss_reset_time = time.time()
     else:
         loss_count = 0
-    log(f"[平仓触发] {reason} | 当前盈亏:{pnl:.2%}")
+    log(f"[平仓触发] {reason}")
     cancel_order()
     if USE_LOCAL_SIMULATION:
         success = send_market_order("SELL" if pos == "long" else "BUY", True)
@@ -1017,6 +1056,10 @@ def close_position(reason):
                 trade_lock = False;
                 entry_time = 0;
                 time_at_max_profit = 0.0
+                try:
+                    log(f"[实盘平仓] 发送成功，等待官方结算更新。平仓前官方浮盈:{off_pnl_before:.2f}U")
+                except:
+                    pass
                 return
             else:
                 sync_position()
@@ -1028,48 +1071,51 @@ def close_position(reason):
 
 
 # ======================
-# 核心处理引擎 (防价格老化降级机制 + 微利极速兑现)
+# 核心处理引擎 (3秒极速止盈+Mark防插针风控)
 # ======================
 def process_price():
+    global last_process_time
     global current_price, raw_price, price_buffer, last_price_print_time
-    global loss_count, last_check_time, processing, last_holding_log_time
+    global loss_count, last_check_time, last_holding_log_time
     global local_max_profit_pct, local_max_price, local_min_price
     global max_profit_pct, max_price_since_entry, min_price_since_entry
     global time_at_max_profit, official_unrealized_profit, official_isolated_margin
-    if processing: return
-    processing = True
-    price_anomaly = False  # 价格偏离标志位，仅拦截开仓，不拦截平仓
+    now = time.time()
+    if now - last_process_time < PROCESS_INTERVAL:
+        return
+    last_process_time = now
+    if manage_position():
+        return
+    price_anomaly = False
     try:
-        now = time.time()
         with data_lock:
             agg_delay = now - last_aggTrade_time
             if raw_price and agg_delay <= 3:
                 snap_price = raw_price
+                price_src = "aggTrade"
             elif mark_price:
                 if agg_delay > 3.5 and agg_delay < 4.0:
                     log(f"⚠️ aggTrade停滞{agg_delay:.1f}秒，降级使用mark_price估值")
                 snap_price = mark_price
+                price_src = "Mark"
             else:
                 snap_price = raw_price
+                price_src = "RawFallback"
         if snap_price is None:
-            processing = False
             return
-        # 价格偏离不再直接 return，只设置标志位
         if raw_price and mark_price:
             diff = abs(raw_price - mark_price) / raw_price
             if diff > 0.001:
                 ws_delay = now - last_ws_time
                 if ws_delay <= 1:
-                    # log("⚠️ 价格偏离异常，仅暂停开仓判断，止盈止损继续执行")
                     price_anomaly = True
         if now - last_price_print_time >= 5:
             ws_delay = now - last_ws_time
             agg_delay = now - last_aggTrade_time
-            log(f"[价格] Last:{raw_price} | Mark:{mark_price if mark_price else 'N/A'} | 延迟:{ws_delay:.1f}s | aggDelay:{agg_delay:.1f}s")
+            log(f"[价格] 现价:{raw_price} | Mark:{mark_price if mark_price else 'N/A'} | 估值源:{price_src} | agg延迟:{agg_delay:.1f}s")
             last_price_print_time = now
         if loss_count >= MAX_CONTINUOUS_LOSS:
             if now - loss_reset_time < LOSS_RESET_SEC:
-                processing = False
                 return
             loss_count = 0
         update_liquidity_zone()
@@ -1077,11 +1123,6 @@ def process_price():
             if liquidity_zone and raw_price:
                 if detect_touch(raw_price, prev_price_v23, liquidity_zone):
                     liquidity_zone.touch_count = min(10, liquidity_zone.touch_count + 1)
-        # 硬止损最高优先级，任何情况都必须执行
-        if manage_position():
-            processing = False
-            return
-        # 盈亏判定双轨制隔离
         if USE_LOCAL_SIMULATION:
             cur_pos = local_position;
             cur_ep = local_entry_price
@@ -1096,28 +1137,31 @@ def process_price():
         if not cur_pos or cur_ep <= 0:
             pass
         else:
-            # 本地撮合统一使用 ROI(资金收益率) 计算，与实盘对齐
             if USE_LOCAL_SIMULATION:
-                # 本地模式计算绝对浮盈
-                pnl_abs = (snap_price - cur_ep) * actual_position_amt if cur_pos == "long" else (
-                                                                                                            cur_ep - snap_price) * actual_position_amt
-                margin = abs(actual_position_amt) * cur_ep / LEVERAGE if LEVERAGE > 0 else 0
-                pr = pnl_abs / margin if margin > 0 else 0  # pr 现在是真正的 ROI
-                if pr <= -SCALP_SL:
-                    close_position(f"硬止损({SCALP_SL * 100}%)")
-                    processing = False
-                    return
-                # 追踪极值价格与极值收益率
+                # 修改：基于 ROI 和保证金计算真实盈亏值
+                position_notional = actual_position_amt * cur_ep
+                margin = position_notional / LEVERAGE if LEVERAGE > 0 else 0
+                price_change_pct = (snap_price - cur_ep) / cur_ep if cur_pos == "long" else (
+                                                                                                        cur_ep - snap_price) / cur_ep
+                pr = price_change_pct * LEVERAGE
+                pnl_abs = margin * pr
+                # 核心修复：本地硬止损使用 Mark Price 判定价格变动比例
+                if mark_price and cur_ep > 0:
+                    mark_change_pct = (mark_price - cur_ep) / cur_ep if cur_pos == "long" else (
+                                                                                                           cur_ep - mark_price) / cur_ep
+                    if mark_change_pct <= -SCALP_SL:
+                        close_position(f"硬止损(Mark防插针{SCALP_SL * 100}%)")
+                        return
                 if cur_pos == "long":
                     if snap_price > cur_max_price: cur_max_price = snap_price; time_at_max_profit = time.time()
                 else:
                     if snap_price < cur_min_price: cur_min_price = snap_price; time_at_max_profit = time.time()
                 local_max_price = cur_max_price;
                 local_min_price = cur_min_price
-                max_pnl_abs = (cur_max_price - cur_ep) * actual_position_amt if cur_pos == "long" else (
-                                                                                                                   cur_ep - cur_min_price) * actual_position_amt
-                max_profit_pct = max_pnl_abs / margin if margin > 0 else 0  # max_profit_pct 也变成真正的最高 ROI
-            # 实盘模式：直接使用官方精准盈亏
+                # 修改：计算最大盈亏 ROI
+                max_price_change_pct = (cur_max_price - cur_ep) / cur_ep if cur_pos == "long" else (
+                                                                                                               cur_ep - cur_min_price) / cur_ep
+                max_profit_pct = max_price_change_pct * LEVERAGE
             else:
                 with lock:
                     off_pnl = official_unrealized_profit
@@ -1135,30 +1179,26 @@ def process_price():
                     min_price_since_entry = cur_min_price
                 pr = off_pnl / off_margin if off_margin > 0 else 0
                 max_pnl_abs = (cur_max_price - cur_ep) * actual_position_amt if cur_pos == "long" else (
-                                                                                                                   cur_ep - cur_min_price) * actual_position_amt
+                                                                                                               cur_ep - cur_min_price) * actual_position_amt
                 margin = abs(actual_position_amt) * cur_ep / LEVERAGE if LEVERAGE > 0 else 0
                 max_profit_pct = max_pnl_abs / margin if margin > 0 else 0
             status_parts = []
-            # 调整手续费门槛判断基准
-            # 20倍杠杆下，0.04%价格波动=0.8%ROI，覆盖双边手续费(约0.06%价格波动)至少需要1.2%的ROI
-            MIN_ROI_COVER_FEE = 0.008  # 0.8% ROI 视为覆盖手续费安全垫
+            MIN_ROI_COVER_FEE = 0.008
             if max_profit_pct > 0:
                 retracement = pr / max_profit_pct if max_profit_pct > 0 else 0
                 time_since_high = time.time() - time_at_max_profit
                 if (USE_LOCAL_SIMULATION and pr < MIN_ROI_COVER_FEE) or (not USE_LOCAL_SIMULATION and off_pnl < 0):
                     status_parts.append(f"追踪止盈(手续费不足🟡 当前ROI:{pr:.2%}<{MIN_ROI_COVER_FEE * 100:.1f}%)")
                 else:
-                    # 微利门槛也按比例放大
                     if max_profit_pct < MIN_ROI_COVER_FEE * 1.2:
                         status_parts.append(
                             f"微利追踪(等待🟡 最高ROI:{max_profit_pct:.2%}<{MIN_ROI_COVER_FEE * 1.2 * 100:.1f}%)")
                     else:
-                        trail_tp = (time_since_high >= 20) and (retracement <= 0.65)
+                        trail_tp = (time_since_high >= 3) or (retracement <= 0.85)
                         status_parts.append(
-                            f"极速追踪({'触发🔴' if trail_tp else '等待🟡'} 历高停顿{time_since_high:.0f}s/20s 回撤比{retracement:.2%}/65%)")
+                            f"极速追踪({'触发🔴' if trail_tp else '等待🟡'} 历高停顿{time_since_high:.0f}s/3s 回撤比{retracement:.2%}/85%)")
                         if trail_tp:
-                            close_position("极速追踪止盈")
-                            processing = False
+                            close_position("极速追踪止盈(3秒)")
                             return
                         avg_vol_10k = 0.0
                         with data_lock:
@@ -1184,30 +1224,28 @@ def process_price():
                             f"回撤遇阻({'触发🔴' if abs_tp else '等待🟡'} 回撤>15%:{'✅' if is_retracement_over_15pct else '❌'} 反向量:{reverse_order_vol:.1f}>2.5倍均量:{avg_vol_10k:.1f}:{'✅' if is_huge_reverse_vol else '❌'})")
                         if abs_tp:
                             close_position("绝对回撤保护(放量遇阻)")
-                            processing = False
                             return
             else:
                 status_parts.append(f"追踪止盈(未启动🟢)")
             if now - last_holding_log_time >= 2:
                 if USE_LOCAL_SIMULATION:
-                    log(f"[本地持仓状态-ROI修正] {cur_pos} | 当前ROI:{pr:.2%} | 最高ROI:{max_profit_pct:.2%} | 状态面板: {' | '.join(status_parts)}")
+                    log(f"[本地持仓状态] {cur_pos} | 均价:{cur_ep:.1f} | 现价:{snap_price:.1f} | Mark:{mark_price:.1f} | 当前ROI:{pr:.2%} | 最高ROI:{max_profit_pct:.2%} | 状态面板: {' | '.join(status_parts)}")
                 else:
                     with lock:
-                        log(f"[实盘持仓状态-官方] {cur_pos} | 官方盈亏:{off_pnl:.2f}U (ROI:{pr:.2%}) | 极值最高ROI:{max_profit_pct:.2%} | 状态面板: {' | '.join(status_parts)}")
+                        log(f"[实盘持仓状态] {cur_pos} | 均价:{cur_ep:.1f} | 官方盈亏:{off_pnl:.2f}U (ROI:{pr:.2%}) | 极值最高ROI:{max_profit_pct:.2%} | 状态面板: {' | '.join(status_parts)}")
                 last_holding_log_time = now
         if time.time() - last_check_time > 1:
             check_order_filled();
             last_check_time = time.time()
         check_order_timeout()
-        # 🚀🚀🚀 核心优化：只有在无持仓时，才执行开仓雷达和开仓策略 🚀🚀🚀
         has_position = local_position if USE_LOCAL_SIMULATION else position
         if not has_position:
             log_entry_conditions()
             has_order = local_active_order if USE_LOCAL_SIMULATION else active_order
             if not has_order and not price_anomaly and time.time() > cooldown_until:
                 v21_scalp_main()
-    finally:
-        processing = False
+    except Exception as e:
+        log(f"[处理引擎异常] {e}")
 
 
 def trade_worker():
@@ -1226,12 +1264,11 @@ def trade_worker():
 
 
 # ======================
-# WebSocket 相关
+# WebSocket 相关 (行情与官方私有流)
 # ======================
 def on_open(ws):
-    global reconnect_delay, processing
+    global reconnect_delay
     reconnect_delay = 5
-    processing = False
     log(f"[WebSocket] 连接成功 ✅ (模式: {'本地撮合-测试网行情' if USE_LOCAL_SIMULATION else 'API实盘'})")
     log("[状态校准] 正在重新同步持仓与余额，清理幽灵状态...")
     sync_position()
@@ -1239,7 +1276,7 @@ def on_open(ws):
     sync_balance()
     params = [
         f"{WS_SYMBOL}@aggTrade", f"{WS_SYMBOL}@markPrice", f"{WS_SYMBOL}@depth5@100ms",
-        f"{WS_SYMBOL}@kline_1m", f"{WS_SYMBOL}@kline_5m", f"{WS_SYMBOL}@kline_15m", f"{WS_SYMBOL}@kline_30m",
+        f"{WS_SYMBOL}@kline_1m", f"{WS_SYMBOL}@kline_15m", f"{WS_SYMBOL}@kline_30m",
         f"{WS_SYMBOL}@kline_1h"
     ]
     sub_msg = {"method": "SUBSCRIBE", "params": params, "id": 1}
@@ -1303,8 +1340,7 @@ def ws_watchdog():
         if time.time() - last_ws_time > 10:
             log("🚨 WS断流超过10秒，主动断开触发重连！")
             try:
-                if ws_app:
-                    ws_app.close()
+                if ws_app: ws_app.close()
             except:
                 pass
             last_ws_time = time.time()
@@ -1330,18 +1366,96 @@ def start_ws():
     threading.Thread(target=run, daemon=True).start()
 
 
+# 🚀🚀🚀 实盘独有：币安用户数据流，获取官方零延迟真实盈亏 🚀🚀🚀
+def start_user_data_stream():
+    if USE_LOCAL_SIMULATION: return
+    global listenKey, user_data_ws_app
+    base_listen_url = f"{BASE_URL}/fapi/v1/listenKey"
+
+    def keepalive_listen_key():
+        while True:
+            time.sleep(1800)
+            try:
+                requests.put(base_listen_url, headers={"X-MBX-APIKEY": API_KEY})
+                log("[UserDataWS] ListenKey 续期成功")
+            except Exception as e:
+                log(f"[UserDataWS] ListenKey 续期失败: {e}")
+
+    def on_user_data_open(ws):
+        log("[UserDataWS] 私有流连接成功 ✅，实时接收官方盈亏推送")
+
+    def on_user_data_message(ws, msg):
+        global official_unrealized_profit, official_isolated_margin, position, entry_price, actual_position_amt
+        try:
+            data = json.loads(msg)
+            if data.get("e") == "ACCOUNT_UPDATE":
+                for pos_data in data.get("a", {}).get("P", []):
+                    if pos_data.get("s") == SYMBOL:
+                        amt = float(pos_data.get("pa", 0))
+                        with lock:
+                            if amt != 0:
+                                position = "long" if amt > 0 else "short"
+                                entry_price = float(pos_data.get("ep", 0))
+                                actual_position_amt = abs(amt)
+                                official_unrealized_profit = float(pos_data.get("up", 0))
+                                official_isolated_margin = float(pos_data.get("iw", 0))
+                            else:
+                                position = None;
+                                entry_price = 0;
+                                actual_position_amt = QTY
+                                official_unrealized_profit = 0.0;
+                                official_isolated_margin = 0.0
+                        trade_queue.put("PROCESS")
+            elif data.get("e") == "ORDER_TRADE_UPDATE":
+                o = data.get("o", {})
+                if o.get("s") == SYMBOL and o.get("X") == "FILLED":
+                    log(f"[实盘成交回报-官方] 订单ID:{o.get('i')} | 方向:{o.get('S')} | 价格:{o.get('L')} | 数量:{o.get('l')} | 手续费:{o.get('n')}{o.get('N')}")
+        except Exception as e:
+            log(f"[UserDataWS] 解析异常: {e}")
+
+    def on_user_data_error(ws, error):
+        log(f"[UserDataWS] 错误: {error}")
+
+    def on_user_data_close(ws, code, msg):
+        log(f"[UserDataWS] 断开，5秒后重连...")
+        time.sleep(5)
+        start_user_data_stream()
+
+    def run():
+        global listenKey, user_data_ws_app
+        try:
+            res = requests.post(base_listen_url, headers={"X-MBX-APIKEY": API_KEY})
+            listenKey = res.json().get("listenKey")
+            if not listenKey:
+                log(f"[UserDataWS] 创建ListenKey失败: {res.json()}")
+                return
+            threading.Thread(target=keepalive_listen_key, daemon=True).start()
+            ws_url = f"wss://fstream.binance.com/ws/{listenKey}"
+            user_data_ws_app = websocket.WebSocketApp(ws_url, on_open=on_user_data_open,
+                                                      on_message=on_user_data_message, on_error=on_user_data_error,
+                                                      on_close=on_user_data_close)
+            user_data_ws_app.run_forever(ping_interval=30, ping_timeout=15)
+        except Exception as e:
+            log(f"[UserDataWS] 启动异常: {e}")
+            time.sleep(5)
+            start_user_data_stream()
+
+    threading.Thread(target=run, daemon=True).start()
+
+
 if __name__ == "__main__":
     log("======================================")
-    mode_str = "本地撮合 (测试网行情)" if USE_LOCAL_SIMULATION else "API真实查询 (实盘)"
-    log(f" V23 流动性剃头皮策略 (多因子评分增强版) 启动成功")
+    mode_str = "本地撮合 (测试网行情)" if USE_LOCAL_SIMULATION else "实盘 (官方精准盈亏驱动)"
+    log(f" V24 流动性高频剃头皮策略 (1m震荡+1m入场+Mark防扫+3秒极速止盈) 启动成功")
     log(f" 当前运行模式: {mode_str}")
-    log(f" 策略: 流动性+Sweep+区间评分 | 启动盈利:0.01% | 止损:{SCALP_SL * 100}% | 区间有效期:{ZONE_VALIDITY_SEC}秒")
+    log(f" 策略: 移除鸡肋过滤 | ROI盈亏重构 | 区间:1mK线 | 止损:Mark价抗插针 | 追踪止盈:3秒极速")
     log("======================================")
     sync_binance_time()
     fetch_initial_klines()
     sync_balance()
     sync_position()
     start_ws()
+    start_user_data_stream()
     threading.Thread(target=trade_worker, daemon=True).start()
     threading.Thread(target=position_monitor, daemon=True).start()
     threading.Thread(target=ws_watchdog, daemon=True).start()
