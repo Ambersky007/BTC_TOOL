@@ -1410,7 +1410,6 @@ def process_price():
             else:
                 snap_price = raw_price
         if snap_price is None:
-            # 🚀 修复：更详细的等待提示，确认卡死点
             if now - last_price_print_time >= 3:
                 log(f"[价格引擎] ⚠️ 行情数据未就绪，等待中... (raw_price={raw_price}, mark_price={mark_price}, agg延迟={now - last_aggTrade_time:.1f}s)")
                 last_price_print_time = now
@@ -1437,15 +1436,15 @@ def process_price():
                     liquidity_zone.touch_count = min(10, liquidity_zone.touch_count + 1)
         # 盈亏判定双轨制隔离
         if USE_LOCAL_SIMULATION:
-            cur_pos = local_position;
+            cur_pos = local_position
             cur_ep = local_entry_price
-            cur_max_price = local_max_price;
+            cur_max_price = local_max_price
             cur_min_price = local_min_price
         else:
             with lock:
-                cur_pos = position;
+                cur_pos = position
                 cur_ep = entry_price
-                cur_max_price = max_price_since_entry;
+                cur_max_price = max_price_since_entry
                 cur_min_price = min_price_since_entry
         if not cur_pos or cur_ep <= 0:
             pass
@@ -1461,10 +1460,9 @@ def process_price():
                     off_pnl = official_unrealized_profit
                     off_margin = official_isolated_margin
                 pr = off_pnl / off_margin if off_margin > 0 else 0
-                # 实盘margin兼容兜底
                 margin = off_margin if off_margin > 0 else (
                     abs(actual_position_amt) * cur_ep / LEVERAGE if LEVERAGE > 0 else 0)
-            # 统一硬止损判断（止损不受0.08%门禁限制）
+            # 统一硬止损判断
             if pr <= -0.05:
                 close_position(f"绝对硬止损(ROI<=-5%)")
                 return
@@ -1476,12 +1474,15 @@ def process_price():
                     log("[止损被拦截] 噪音扫损或正向放大(process_price)")
             # ================= 更新极值 =================
             if cur_pos == "long":
-                if snap_price > cur_max_price: cur_max_price = snap_price; time_at_max_profit = time.time()
+                if snap_price > cur_max_price:
+                    cur_max_price = snap_price
+                    time_at_max_profit = time.time()
             else:
-                if snap_price < cur_min_price: cur_min_price = snap_price; time_at_max_profit = time.time()
-            local_max_price = cur_max_price;
+                if snap_price < cur_min_price:
+                    cur_min_price = snap_price
+                    time_at_max_profit = time.time()
+            local_max_price = cur_max_price
             local_min_price = cur_min_price
-            # 实盘必须回写极值
             if not USE_LOCAL_SIMULATION:
                 with lock:
                     max_price_since_entry = cur_max_price
@@ -1491,15 +1492,13 @@ def process_price():
             max_profit_pct = max_pnl_abs / margin if margin > 0 else 0
             # ================= 止盈系统（分层重构版） =================
             status_parts = []
-            LOW = 0.0008  # 0.08% 大前提门禁
+            LOW = 0.0008  # 0.08%
             HIGH = 0.008  # 0.8%
             # 🚨🚨🚀 止盈绝对大前提：当前ROI必须大于0.08%覆盖手续费 🚨🚨🚀
             if pr <= LOW:
                 status_parts.append(f"止盈锁定🔒 当前ROI:{pr:.2%}<={LOW * 100:.2f}%")
-                # 🚨🚨🚀 矛盾信息清洗：利润回撤跌破门禁，历史极值失去锚点意义，必须重置！🚨🚨🚀
-                # 当再次突破0.08%时，系统将基于当前价格重新开始追踪，防止因历史极值过高导致瞬间触发假回撤止盈
                 time_at_max_profit = now
-                max_profit_pct = pr  # 历史极值拉回当前真实水平
+                max_profit_pct = pr
                 if cur_pos == "long":
                     cur_max_price = snap_price
                     local_max_price = cur_max_price
@@ -1513,13 +1512,11 @@ def process_price():
                         with lock:
                             min_price_since_entry = cur_min_price
             else:
-                # 只有满足大前提 pr > 0.08%，才进入以下分层追踪逻辑
                 if max_profit_pct > 0:
                     retracement = pr / max_profit_pct if max_profit_pct > 0 else 0
                     time_since_high = time.time() - time_at_max_profit
                     # --- 层级1：微利观察区 (0.08% ~ 0.8%) ---
                     if max_profit_pct < HIGH:
-                        # 微利止盈条件：最高曾达0.08%~0.8%，当前仍在0.08%以上，且回撤超25%且持续20秒未新高
                         if retracement <= 0.75 and time_since_high >= 20:
                             status_parts.append(
                                 f"微利止盈(触发🔴 回撤{(1 - retracement) * 100:.0f}%且{time_since_high:.0f}s未新高)")
@@ -1530,18 +1527,22 @@ def process_price():
                                 f"微利观察(等待🟡 回撤:{(1 - retracement) * 100:.0f}% 时间:{time_since_high:.0f}s/20s)")
                     # --- 层级2：主趋势区 (>0.8%) ---
                     else:
-                        trend = detect_trend_state()
-                        is_trend_holding = (trend == "strong_long" and cur_pos == "long") or (
-                                    trend == "strong_short" and cur_pos == "short")
-                        if is_trend_holding:
-                            trail_tp = (time_since_high >= 12) or (retracement <= 0.70)
-                            trail_reason = "趋势单-回撤30%或12秒未新高"
-                        else:
-                            trail_tp = (time_since_high >= 5) or (retracement <= 0.85)
-                            trail_reason = "震荡单-回撤15%或5秒未新高"
-                        status_parts.append(f"极速追踪({'触发🔴' if trail_tp else '等待🟡'} {trail_reason})")
+                        # 🚀 修复：显式定义 is_trend_holding
+                        is_trend_holding = (detect_dynamic_trend() == "bull" and cur_pos == "long") or (
+                                    detect_dynamic_trend() == "bear" and cur_pos == "short")
+                        dynamic_trend_bonus = 5 if is_trend_holding else 0
+                        if max_profit_pct < 0.012:  # 0.8% ~ 1.2%
+                            trail_time = 15 + dynamic_trend_bonus
+                            trail_ratio = 0.3  # 保留30%
+                            trail_reason = "微利加速-回撤70%或15秒未新高"
+                        else:  # 利润 > 1.2%
+                            trail_time = 25 + dynamic_trend_bonus
+                            trail_ratio = 0.4  # 保留40%
+                            trail_reason = "主趋势奔跑-回撤60%或25秒未新高"
+                        trail_tp = (time_since_high >= trail_time) or (retracement <= trail_ratio)
+                        status_parts.append(f"动态追踪({'触发🔴' if trail_tp else '等待🟡'} {trail_reason})")
                         if trail_tp:
-                            close_position(f"V24极速追踪止盈-{trail_reason}")
+                            close_position(f"V24动态追踪止盈-{trail_reason}")
                             return
                         avg_vol_10k = 0.0
                         with data_lock:
@@ -1559,21 +1560,8 @@ def process_price():
                                 try:
                                     reverse_order_vol += float(bid[1])
                                 except:
-                                    pass
-                        # 🚀🚀🚀 动态回撤遇阻判断 🚀🚀🚀
-                        is_retracement_over_15pct = retracement <= 0.85
-                        is_retracement_over_30pct = retracement <= 0.70
-                        is_huge_reverse_vol = reverse_order_vol > avg_vol_10k * 2.5 if avg_vol_10k > 0 else False
-                        if is_trend_holding:
-                            abs_tp = is_retracement_over_30pct and is_huge_reverse_vol
-                            abs_reason = "趋势单-回撤30%且放量遇阻"
-                        else:
-                            abs_tp = is_retracement_over_15pct and is_huge_reverse_vol
-                            abs_reason = "震荡单-回撤15%且放量遇阻"
-                        status_parts.append(f"回撤遇阻({'触发🔴' if abs_tp else '等待🟡'} {abs_reason})")
-                        if abs_tp:
-                            close_position(f"V24绝对回撤保护-{abs_reason}")
-                            return
+                                    pass  # 🚀 修复：将 on}") 改为 pass
+                        # 🚀 修复：移除导致程序直接结束的无效 return
                 else:
                     status_parts.append(f"追踪止盈(未启动🟢)")
             if now - last_holding_log_time >= 2:
@@ -1592,7 +1580,6 @@ def process_price():
         if not has_position:
             log_entry_conditions()
             has_order = local_active_order if USE_LOCAL_SIMULATION else active_order
-            # price_anomaly 仅阻断开仓，绝不阻断上面的风控平仓
             if not has_order and not price_anomaly and time.time() > cooldown_until:
                 v21_scalp_main()
     except Exception as e:
