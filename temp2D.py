@@ -30,7 +30,7 @@ logger.addHandler(file_handler)
 def log(msg):
     try:
         print(msg)
-        logger.info(str(msg))
+        #logger.info(str(msg))     不生成本地文件了
     except Exception as e:
         print(f"[LOG ERROR] {e} | 原始: {msg}")
 
@@ -1226,14 +1226,14 @@ def scalp_entry():
     custom_qty = get_dynamic_qty(price, ratio=POSITION_RATIO, notional_multiplier=notional_multiplier)
     # ================= 开仓执行逻辑 =================
     if price <= zone.low + PRICE_STEP * 5:
-        if zone.touch_count >= 0 and (
+        if zone.touch_count >= 2 and (
                 bias != "bear" or detect_absorption() or exhaustion) and last_trade_side != "sell":
             if long_allowed:
                 current_entry_strategy = f"V23低吸-轨外10U({strategy_suffix}评分{current_zone_score})"
                 send_limit_order("BUY", buy_price, custom_qty=custom_qty)
                 return
     if price >= zone.high - PRICE_STEP * 5:
-        if zone.touch_count >= 0 and (bias != "bull" or detect_absorption() or exhaustion) and last_trade_side != "buy":
+        if zone.touch_count >= 2 and (bias != "bull" or detect_absorption() or exhaustion) and last_trade_side != "buy":
             if short_allowed:
                 current_entry_strategy = f"V23高抛-轨外10U({strategy_suffix}评分{current_zone_score})"
                 send_limit_order("SELL", sell_price, custom_qty=custom_qty)
@@ -1407,6 +1407,8 @@ def save_trade_records():
 def close_position(reason):
     global loss_count, cooldown_until, loss_reset_time, entry_time, time_at_max_profit, current_entry_strategy
     global official_unrealized_profit, official_isolated_margin, entry_atr
+    # 🚀 新增声明：需要在外部修改的实盘全局变量
+    global stop_watch_count, trade_lock, actual_position_amt, position, entry_price
     if USE_LOCAL_SIMULATION:
         pos = local_position;
         ep = local_entry_price
@@ -1460,8 +1462,18 @@ def close_position(reason):
                 trade_lock = False
                 entry_time = 0
                 time_at_max_profit = 0.0
+                stop_watch_count = 0  # 🚀 修复1：清零V24状态机计数器，防止下次开仓继承观察期状态
+                # 🚀 修复2：双机制并存 - 立即本地清理持仓，防止 process_price 死循环重复平仓
+                # 官方 ACCOUNT_UPDATE 推送依然保留，会在稍后到达进行二次确认/纠偏，两者互不冲突
+                with lock:
+                    position = None
+                    entry_price = 0
+                    official_unrealized_profit = 0.0
+                    official_isolated_margin = 0.0
+                    actual_position_amt = QTY
+                    entry_atr = 0.0
                 try:
-                    log(f"[实盘平仓] 发送成功，等待官方结算更新。平仓前官方浮盈:{off_pnl_before:.2f}U")
+                    log(f"[实盘平仓] 发送成功，本地已强制清空持仓防重入，等待官方推送最终确认。平仓前官方浮盈:{off_pnl_before:.2f}U")
                 except:
                     pass
                 return
@@ -1472,7 +1484,6 @@ def close_position(reason):
             time.sleep(3)
         log("🚨🚨🚨 严重警告：连续10次强平失败，交易线程放弃重试，请人工干预！🚨🚨🚨")
         trade_lock = False
-
 
 # ======================
 # 核心处理引擎 (防价格老化降级机制 + 微利极速兑现)
@@ -1627,13 +1638,13 @@ def process_price():
                                     detect_dynamic_trend() == "bear" and cur_pos == "short")
                         dynamic_trend_bonus =20 if is_trend_holding else 0
                         if max_profit_pct < 0.012:  # 0.8% ~ 1.2%
-                            trail_time = 35 + dynamic_trend_bonus
+                            trail_time = 125 + dynamic_trend_bonus
                             trail_ratio = 0.7 # 保留70%
-                            trail_reason = "微利加速-回撤70%或35秒未新高"
+                            trail_reason = "微利加速-回撤70%或125秒未新高"
                         else:  # 利润 > 1.2%
                             trail_time = 100 + dynamic_trend_bonus
-                            trail_ratio = 0.6  # 保留60%
-                            trail_reason = "主趋势奔跑-回撤40%或100秒未新高"
+                            trail_ratio = 0.7  # 保留70%
+                            trail_reason = "主趋势奔跑-回撤30%或100秒未新高"
                         trail_tp = (time_since_high >= trail_time) or (retracement <= trail_ratio)
                         status_parts.append(f"动态追踪({'触发🔴' if trail_tp else '等待🟡'} {trail_reason})")
                         if trail_tp:
@@ -1943,7 +1954,7 @@ def start_user_data_stream():
 
 if __name__ == "__main__":
     log("======================================")
-    mode_str = "本地撮合 (测试网行情)" if USE_LOCAL_SIMULATION else "实盘 (官方精准盈亏驱动)"
+    mode_str = "本地撮合 (实盘网行情)" if USE_LOCAL_SIMULATION else "实盘 (官方精准盈亏驱动)"
     log(f" V23 流动性剃头皮策略 (防卡死+防幽灵+防抢跑增强版) 启动成功")
     log(f" 当前运行模式: {mode_str}")
     log(f" 策略: 流动性+Sweep+区间评分 | 启动盈利:0.01% | 止损:{SCALP_SL * 100}% | 区间有效期:动态ATR自适应")
